@@ -1,80 +1,67 @@
 # free-claude
 
-## mitm 
-mitmweb -s mitm_addon.py -p 8080 --ssl-insecure \
-  --ignore-hosts 'apple\.com|push\.apple\.com|icloud\.com'
+多 AI 平台 OpenAI 兼容中转 API（当前支持豆包，可扩展 DeepSeek / ChatGPT 等）。
 
-豆包 WebSocket 中转 + Claude Code OpenAI 兼容 API。
+## 架构
 
-## 一、快速开始（自动获取凭证，推荐）
-
-```bash
-cd free-claude
-chmod +x run.sh
-./run.sh
+```
+providers/
+  base.py          # ChatProvider 抽象接口
+  registry.py      # 注册与路由（按 model 名选择提供商）
+  doubao/          # 豆包实现
+    browser.py     # Playwright + SSE
+    provider.py
+  deepseek/        # 后续扩展
+  openai/          # 后续扩展
+params/
+  doubao/session.json    # 豆包凭证（自动生成）
+.profiles/
+  doubao/                # 豆包浏览器登录态
 ```
 
-或手动：
+新增平台：实现 `ChatProvider`，在 `registry.py` 中 `register_provider` 即可。
+
+## 快速开始
 
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium   # 仅首次需要
-python trans_api.py
-```
-
-> 不要用系统自带的 `python trans_api.py`，必须用 `venv` 里的 Python。
-
-**每次启动 `trans_api.py` 时**会自动：
-1. 删除旧的 `doubao_ws_params.json`
-2. 用 Playwright 登录豆包并保存 `sessionid`
-3. 对话通过浏览器内 `/chat/completion` SSE 完成（自动注入 a_bogus，无需抓 WebSocket）
-4. 登录状态保存在 `.doubao_browser_profile/`
-
-也可手动刷新凭证：
-
-```bash
-python doubao_auth.py
+chmod +x run.sh && ./run.sh
 ```
 
 测试：
 
 ```bash
+curl http://127.0.0.1:8000/v1/models
+
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"doubao-claude","messages":[{"role":"user","content":"1+1="}],"stream":false}'
 ```
 
-遇到 **401** 时会自动重新抓取参数；无需手抄 `sessionid`。
-
----
-
-## 二、备选：手动抓包
-
-若 Playwright 不可用，可手动从 Chrome DevTools 复制 WS URL + `sessionid` 到 `doubao_ws_params.json`。参考 `doubao_ws_params.example.json`。
-
-### mitmproxy 抓包
+手动刷新豆包凭证：
 
 ```bash
-mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
+python doubao_auth.py
 ```
 
----
-
-## 三、接入 Claude Code
+## 接入 Claude Code
 
 ```
 OPENAI_API_BASE=http://127.0.0.1:8000/v1
 OPENAI_API_KEY=sk-any
 ```
 
----
+## 备选：mitmproxy 抓包
 
-## 四、常见问题
+```bash
+mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
+```
+
+WS 参数保存至 `params/doubao/ws_params.json`。
+
+## 常见问题
 
 | 现象 | 处理 |
 |------|------|
 | 弹出浏览器要求登录 | 首次正常，登录后自动继续 |
-| `playwright install chromium` | 首次安装浏览器内核 |
-| API 返回 401 | 会自动刷新；失败则运行 `python doubao_auth.py` |
-| `certificate unknown` (手机) | 与 API 无关；手机抓包见 mitmproxy 方案 |
+| `未知模型` | 查看 `GET /v1/models` 支持的 model 列表 |
+| API 返回 502 | 运行 `python doubao_auth.py` 重新登录 |

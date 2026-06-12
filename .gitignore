@@ -1,6 +1,8 @@
 venv
 .codegraph
-doubao_ws_params.json
+params/*/session.json
+params/*/ws_params.json
+.profiles/
 .doubao_browser_profile
 __pycache__/
 *.py[cod]

@@ -6,6 +6,10 @@ from mitmproxy import ctx, tls
 from mitmproxy.net import tls as net_tls
 from OpenSSL import SSL
 
+from paths import ensure_provider_dir, provider_param_file
+
+PARAM_FILE = provider_param_file("doubao", "ws_params.json")
+
 # 全局缓存
 class GlobalCache:
     ws_params = {}
@@ -17,7 +21,6 @@ class GlobalCache:
     last_error = ""
 
 cache = GlobalCache()
-PARAM_FILE = "doubao_ws_params.json"
 
 # 方式 B：对指定域名关闭上游证书校验（mitmproxy 11 API）
 PASSTHROUGH_HOSTS = ("doubao.com", "kugou.com")
@@ -92,6 +95,7 @@ class Addon:
             parsed = urlparse(url)
             qs = parse_qs(parsed.query)
             cache.ws_params = {k: v[0] for k, v in qs.items()}
+            ensure_provider_dir("doubao")
             with open(PARAM_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache.ws_params, f, ensure_ascii=False, indent=2)
             ctx.log.info("[✅ 已保存豆包WS连接参数]")
