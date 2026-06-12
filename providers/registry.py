@@ -29,7 +29,10 @@ def list_models() -> list[str]:
 
 async def startup_all(*, refresh_credentials: bool = True) -> None:
     for provider in _providers.values():
-        await provider.startup(refresh_credentials=refresh_credentials)
+        try:
+            await provider.startup(refresh_credentials=refresh_credentials)
+        except Exception as e:
+            print(f"[startup] {provider.id} 跳过: {e}")
 
 
 async def shutdown_all() -> None:
@@ -38,9 +41,11 @@ async def shutdown_all() -> None:
 
 
 def _load_providers() -> None:
+    from providers.deepseek.provider import DeepSeekProvider
     from providers.doubao.provider import DoubaoProvider
 
     register_provider(DoubaoProvider())
+    register_provider(DeepSeekProvider())
 
 
 _load_providers()

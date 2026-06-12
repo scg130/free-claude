@@ -9,6 +9,7 @@ from OpenSSL import SSL
 from paths import ensure_provider_dir, provider_param_file
 
 PARAM_FILE = provider_param_file("doubao", "ws_params.json")
+DEEPSEEK_PARAM_FILE = provider_param_file("deepseek")
 
 # 全局缓存
 class GlobalCache:
@@ -23,7 +24,7 @@ class GlobalCache:
 cache = GlobalCache()
 
 # 方式 B：对指定域名关闭上游证书校验（mitmproxy 11 API）
-PASSTHROUGH_HOSTS = ("doubao.com", "kugou.com")
+PASSTHROUGH_HOSTS = ("doubao.com", "kugou.com", "deepseek.com")
 
 
 def _match_passthrough_host(data: tls.TlsData) -> bool:
@@ -99,6 +100,22 @@ class Addon:
             with open(PARAM_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache.ws_params, f, ensure_ascii=False, indent=2)
             ctx.log.info("[✅ 已保存豆包WS连接参数]")
+
+        if "chat.deepseek.com" in url and "/api/v0/" in url:
+            auth = flow.request.headers.get("authorization", "")
+            cookie_hdr = flow.request.headers.get("cookie", "")
+            ds_session_id = ""
+            for part in cookie_hdr.split(";"):
+                part = part.strip()
+                if part.startswith("ds_session_id="):
+                    ds_session_id = part.split("=", 1)[1]
+                    break
+            if auth and ds_session_id:
+                ensure_provider_dir("deepseek")
+                data = {"ds_session_id": ds_session_id, "authorization": auth}
+                with open(DEEPSEEK_PARAM_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                ctx.log.info("[✅ 已保存 DeepSeek 会话凭证]")
 
     # mitmproxy 11：websocket_message 仅接收 flow，消息在 flow.websocket.messages[-1]
     def websocket_message(self, flow):

@@ -1,27 +1,24 @@
 import json
 import time
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from providers import get_provider, list_models, shutdown_all, startup_all
-from providers.doubao.browser import session_ready
+from providers.doubao.browser import session_ready as doubao_session_ready
+from providers.deepseek.browser import session_ready as deepseek_session_ready
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[startup] 初始化 AI 提供商…")
-    if session_ready():
-        print("[startup] 使用已有豆包凭证，跳过浏览器登录")
-    else:
-        try:
-            await startup_all(refresh_credentials=True)
-            print(f"[startup] 已就绪: {', '.join(list_models())}")
-        except Exception as e:
-            print(f"[startup] 凭证获取失败: {e}")
-            print("[startup] 服务仍将启动，首次请求时会重试")
+    await startup_all(
+        refresh_credentials=not (doubao_session_ready() or deepseek_session_ready())
+    )
+    print(f"[startup] 已注册模型: {', '.join(list_models())}")
     yield
     print("[shutdown] 关闭提供商资源…")
     try:
@@ -63,12 +60,29 @@ def _resolve_model(model: str) -> str:
         return "doubao-claude"
 
 
-async def _run_chat(model: str, user_prompt: str) -> tuple[str, str]:
+async def _run_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    system: Any = None,
+    tools: list[dict] | None = None,
+) -> tuple[Any, str]:
     provider = get_provider(_resolve_model(model))
-    result = await provider.chat(user_prompt, get_conv_id())
-    if not result.content:
+    conv_id = get_conv_id()
+
+    if tools:
+        result = await provider.chat_agent(
+            messages, conv_id, system=system, tools=tools, model=model
+        )
+    else:
+        user_prompt = _extract_user_text(messages)
+        if not user_prompt:
+            raise HTTPException(status_code=400, detail="未检测到用户提问")
+        result = await provider.chat(user_prompt, conv_id)
+
+    if not result.content and not result.content_blocks:
         raise HTTPException(status_code=502, detail=f"{provider.display_name} 未返回内容")
-    return result.content, provider.display_name
+    return result, provider.display_name
 
 
 class ChatRequest(BaseModel):
@@ -85,6 +99,8 @@ class MessagesRequest(BaseModel):
     max_tokens: int = 4096
     messages: list[dict]
     stream: bool = False
+    system: str | list | None = None
+    tools: list[dict] | None = Field(default=None)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -103,27 +119,36 @@ async def list_available_models():
     }
 
 
-def _anthropic_message_dict(msg_id: str, model: str, content: str) -> dict:
+def _anthropic_message_dict(
+    msg_id: str, model: str, content_blocks: list[dict], stop_reason: str
+) -> dict:
     return {
         "id": msg_id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": content}],
-        "stop_reason": "end_turn",
+        "content": content_blocks,
+        "stop_reason": stop_reason,
         "usage": {"input_tokens": 0, "output_tokens": 0},
     }
 
 
+def _content_blocks_from_result(result) -> tuple[list[dict], str]:
+    if result.content_blocks:
+        return result.content_blocks, result.stop_reason
+    return [{"type": "text", "text": result.content}], result.stop_reason
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(req: MessagesRequest):
-    """Claude Code 使用的 Anthropic Messages API（支持 ?beta=true）。"""
-    user_prompt = _extract_user_text(req.messages)
-    if not user_prompt:
-        raise HTTPException(status_code=400, detail="未检测到用户提问")
+    """Claude Code Anthropic Messages API（支持 tools → tool_use）。"""
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages 不能为空")
 
     try:
-        content, _ = await _run_chat(req.model, user_prompt)
+        result, _ = await _run_chat(
+            req.model, req.messages, system=req.system, tools=req.tools
+        )
     except HTTPException:
         raise
     except ValueError as e:
@@ -132,29 +157,38 @@ async def anthropic_messages(req: MessagesRequest):
         raise HTTPException(status_code=502, detail=str(e)) from e
 
     msg_id = f"msg_{int(time.time())}"
+    blocks, stop_reason = _content_blocks_from_result(result)
 
     if req.stream:
         async def anthropic_stream():
-            message = _anthropic_message_dict(msg_id, req.model, "")
+            message = _anthropic_message_dict(msg_id, req.model, [], stop_reason)
             yield (
                 "event: message_start\n"
                 f"data: {json.dumps({'type': 'message_start', 'message': message}, ensure_ascii=False)}\n\n"
             )
-            yield (
-                "event: content_block_start\n"
-                f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n"
-            )
-            yield (
-                "event: content_block_delta\n"
-                f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}}, ensure_ascii=False)}\n\n"
-            )
-            yield (
-                "event: content_block_stop\n"
-                f"data: {json.dumps({'type': 'content_block_stop', 'index': 0}, ensure_ascii=False)}\n\n"
-            )
+            for idx, block in enumerate(blocks):
+                yield (
+                    "event: content_block_start\n"
+                    f"data: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': block}, ensure_ascii=False)}\n\n"
+                )
+                if block.get("type") == "text":
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'text_delta', 'text': block.get('text', '')}}, ensure_ascii=False)}\n\n"
+                    )
+                elif block.get("type") == "tool_use":
+                    inp = json.dumps(block.get("input", {}), ensure_ascii=False)
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': inp}}, ensure_ascii=False)}\n\n"
+                    )
+                yield (
+                    "event: content_block_stop\n"
+                    f"data: {json.dumps({'type': 'content_block_stop', 'index': idx}, ensure_ascii=False)}\n\n"
+                )
             yield (
                 "event: message_delta\n"
-                f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
+                f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
             )
             yield (
                 "event: message_stop\n"
@@ -163,7 +197,7 @@ async def anthropic_messages(req: MessagesRequest):
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream")
 
-    return _anthropic_message_dict(msg_id, req.model, content)
+    return _anthropic_message_dict(msg_id, req.model, blocks, stop_reason)
 
 
 @app.post("/v1/chat/completions")
@@ -178,7 +212,8 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     try:
-        content, _ = await _run_chat(req.model, user_prompt)
+        result, _ = await _run_chat(req.model, req.messages)
+        content = result.content
     except HTTPException:
         raise
     except Exception as e:

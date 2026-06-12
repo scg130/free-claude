@@ -18,4 +18,4 @@ class DoubaoProvider(ChatProvider):
 
     async def chat(self, prompt: str, conv_id: str) -> ChatResult:
         text = await browser.chat_completion(prompt, conv_id)
-        return ChatResult(content=text, chunks=[text])
+        return ChatResult.from_text(text)
