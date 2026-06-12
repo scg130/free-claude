@@ -1,0 +1,6 @@
+mitmproxy
+websockets
+fastapi
+uvicorn
+pydantic
+python-multipart
