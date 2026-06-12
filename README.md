@@ -1,5 +1,9 @@
 # free-claude
 
+## mitm 
+mitmweb -s mitm_addon.py -p 8080 --ssl-insecure \
+  --ignore-hosts 'apple\.com|push\.apple\.com|icloud\.com'
+
 豆包 WebSocket 中转 + Claude Code OpenAI 兼容 API。
 
 ## 一、快速开始（自动获取凭证，推荐）

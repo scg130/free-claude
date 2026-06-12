@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from doubao_browser import PARAM_FILE, refresh_credentials
+from doubao_browser import PARAM_FILE, refresh_credentials, shutdown as browser_shutdown
 from mitm_addon import cache
 from ws_bridge import send_prompt_to_doubao
 
@@ -23,6 +23,11 @@ async def lifespan(app: FastAPI):
         print(f"[startup] 凭证获取失败: {e}")
         print("[startup] 服务仍将启动，首次请求时会重试获取")
     yield
+    print("[shutdown] 正在关闭浏览器…")
+    try:
+        await browser_shutdown()
+    except Exception as e:
+        print(f"[shutdown] 浏览器关闭异常（可忽略）: {e}")
 
 
 app = FastAPI(title="Doubao -> Claude Code 中转API", lifespan=lifespan)

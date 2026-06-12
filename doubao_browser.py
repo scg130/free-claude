@@ -309,4 +309,10 @@ async def chat_completion(prompt: str, conv_id: str) -> str:
         return await _chat_locked(prompt, conv_id)
 
 
+async def shutdown() -> None:
+    """关闭 Playwright 浏览器，供服务退出时调用。"""
+    async with _browser_lock:
+        await _close_browser()
+
+
 refresh_ws_params = refresh_credentials
