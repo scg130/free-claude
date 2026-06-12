@@ -19,6 +19,16 @@ def api_key_ready() -> bool:
     return browser.session_ready()
 
 
+def _extract_user_text(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and content:
+            return content
+    return ""
+
+
 def _model_flags(model: str | None) -> tuple[str, bool]:
     name = (model or "deepseek-chat").lower()
     model_type = "expert" if any(x in name for x in ("v4", "r4", "expert")) else "default"
@@ -139,8 +149,9 @@ async def chat_agent(
 ) -> ChatResult:
     if tools:
         prompt = build_agent_prompt(messages, system, tools)
+        user_hint = _extract_user_text(messages)
         raw = await _web_completion(prompt, model=model)
-        agent = parse_agent_response(raw)
+        agent = parse_agent_response(raw, user_hint=user_hint)
         blocks = to_anthropic_content(agent)
         return ChatResult.from_blocks(blocks, stop_reason=agent.stop_reason)
 

@@ -120,7 +120,7 @@ async def list_available_models():
 
 
 def _anthropic_message_dict(
-    msg_id: str, model: str, content_blocks: list[dict], stop_reason: str
+    msg_id: str, model: str, content_blocks: list[dict], stop_reason: str | None
 ) -> dict:
     return {
         "id": msg_id,
@@ -161,15 +161,23 @@ async def anthropic_messages(req: MessagesRequest):
 
     if req.stream:
         async def anthropic_stream():
-            message = _anthropic_message_dict(msg_id, req.model, [], stop_reason)
+            message = _anthropic_message_dict(msg_id, req.model, [], None)
             yield (
                 "event: message_start\n"
                 f"data: {json.dumps({'type': 'message_start', 'message': message}, ensure_ascii=False)}\n\n"
             )
             for idx, block in enumerate(blocks):
+                start_block = block
+                if block.get("type") == "tool_use":
+                    start_block = {
+                        "type": "tool_use",
+                        "id": block["id"],
+                        "name": block["name"],
+                        "input": {},
+                    }
                 yield (
                     "event: content_block_start\n"
-                    f"data: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': block}, ensure_ascii=False)}\n\n"
+                    f"data: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': start_block}, ensure_ascii=False)}\n\n"
                 )
                 if block.get("type") == "text":
                     yield (

@@ -77,13 +77,15 @@ curl -s -X POST http://127.0.0.1:8000/v1/messages \
   }'  
 ```
 
-3. 让 Claude Code 使用 DeepSeek：
+3. Agent 写文件（需授权 + 重启 `./run.sh` 加载最新 bridge）：
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=sk-any
-claude --model deepseek-chat -p "写一个快速排序到 test.py"
+claude --model deepseek-coder --permission-mode bypassPermissions -p "写一个快速排序到 test.py"
 ```
+
+`-p` 会执行工具，但必须加 `--permission-mode bypassPermissions`（或 `--dangerously-skip-permissions`），否则 Write 不会落盘。
 
 | 对比 | 豆包 | DeepSeek |
 |------|------|----------|
@@ -109,7 +111,7 @@ Claude Code 写文件依赖 API 返回 **`tool_use`**。现已通过 `providers/
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=sk-any
-claude -p "写一个快速排序到 test.py"
+claude --model deepseek-coder --permission-mode bypassPermissions -p "写一个冒泡排序到 test.py"
 ```
 
 ```

@@ -89,6 +89,7 @@ def build_agent_prompt(
             "- 可同时输出说明文字 + 一行 JSON\n"
             "- 不需要工具时，只输出普通文字，不要输出 JSON\n"
             "- 禁止输出 [调用 Write]、[工具 xxx 返回]、### 用户 等格式\n"
+            "- 禁止用 <function_json> 等 XML 标签包裹\n"
             "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复"
         )
 
@@ -179,30 +180,176 @@ def _extract_bracket_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
     return clean, tool_uses
 
 
-def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
-    """从模型回复中解析 tool_uses JSON，返回 (纯文本, 工具列表)。"""
-    text = _truncate_hallucinated_turns(text)
-    pattern = re.compile(
-        r'\{\s*"tool_uses"\s*:\s*\[.*?\]\s*\}',
-        re.DOTALL,
+def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
+    """解析 [已调用工具 Write id=toolu_xxx input={...}] 格式（模型仿造对话历史）。"""
+    header = re.compile(
+        r"\[已调用工具\s+(\w+)\s+id=([^\s]+)\s+input=",
+        re.IGNORECASE,
     )
-    match = pattern.search(text)
-    if not match:
-        fence = re.search(r"```(?:json)?\s*(\{.*?\"tool_uses\".*?\})\s*```", text, re.DOTALL)
-        if fence:
-            match = fence
-
-    if not match:
-        return _extract_bracket_tool_calls(text)
-
-    raw_json = match.group(1) if match.lastindex else match.group(0)
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return _extract_bracket_tool_calls(text)
-
     tool_uses: list[ToolUseBlock] = []
-    for item in data.get("tool_uses", []):
+    spans: list[tuple[int, int]] = []
+
+    for match in header.finditer(text):
+        name = match.group(1)
+        tid = match.group(2)
+        obj, end = _decode_json_object(text, match.end())
+        if not obj or not isinstance(obj, dict):
+            continue
+        if not tid.startswith("toolu_"):
+            tid = f"toolu_{tid}"
+        tool_uses.append(ToolUseBlock(id=tid, name=name, input=obj))
+        spans.append((match.start(), end))
+
+    if not tool_uses:
+        return text.strip(), []
+
+    clean_parts: list[str] = []
+    last = 0
+    for start, end in spans:
+        clean_parts.append(text[last:start])
+        last = end
+    clean_parts.append(text[last:])
+    return _truncate_hallucinated_turns("".join(clean_parts).strip()), tool_uses
+
+
+def _unwrap_tool_markup(text: str) -> str:
+    """去掉 <function_json>、<tool_call> 等包裹，保留内部 JSON。"""
+    text = re.sub(
+        r"<function_json>\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s*</function_json>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<tool_call>\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*</tool_call>", "", text, flags=re.IGNORECASE)
+    return text
+
+
+def _repair_tool_json_text(raw: str) -> str:
+    """修复 DeepSeek 常见截断：缺少数组 ]，如 ...\"}}} 应为 ...\"}}]}。"""
+    raw = raw.strip()
+    if raw.endswith('"}}}'):
+        return raw[:-1] + "]" + raw[-1]
+    if raw.endswith('"}}'):
+        return raw + "]}"
+    return raw
+
+
+def _read_json_string(text: str, start: int) -> tuple[str | None, int]:
+    """从 text[start] 处的 opening quote 读取 JSON 字符串（含转义）。"""
+    if start >= len(text) or text[start] != '"':
+        return None, start
+    i = start + 1
+    out: list[str] = []
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 >= len(text):
+                return None, start
+            nxt = text[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == "t":
+                out.append("\t")
+            elif nxt == "r":
+                out.append("\r")
+            elif nxt == '"':
+                out.append('"')
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == "u" and i + 5 < len(text):
+                try:
+                    out.append(chr(int(text[i + 2 : i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    return None, start
+            else:
+                out.append(nxt)
+            i += 2
+            continue
+        if ch == '"':
+            return "".join(out), i + 1
+        out.append(ch)
+        i += 1
+    return None, start
+
+
+def _extract_write_from_partial_json(text: str) -> list[ToolUseBlock]:
+    """JSON 无法完整解析时，从 tool_uses Write 片段提取 file_path / content。"""
+    if '"tool_uses"' not in text and "<function_json>" not in text.lower():
+        return []
+
+    fp_match = re.search(r'"file_path"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    if not fp_match:
+        return []
+    try:
+        file_path = json.loads(f'"{fp_match.group(1)}"')
+    except json.JSONDecodeError:
+        file_path = fp_match.group(1)
+
+    content_key = text.find('"content"')
+    if content_key < 0:
+        return []
+    colon = text.find(":", content_key)
+    if colon < 0:
+        return []
+    quote = text.find('"', colon + 1)
+    if quote < 0:
+        return []
+    content, _ = _read_json_string(text, quote)
+    if not content or len(content) < 10:
+        return []
+
+    return [
+        ToolUseBlock(
+            id="toolu_001",
+            name="Write",
+            input={"file_path": file_path, "content": content},
+        )
+    ]
+
+
+def _decode_json_object_loose(text: str, start: int) -> tuple[dict | None, int]:
+    obj, end = _decode_json_object(text, start)
+    if obj:
+        return obj, end
+
+    end_bound = len(text)
+    for marker in ("</function_json>", "</tool_call>", "\n### ", "\n[工具 ", "\n[Tool "):
+        idx = text.find(marker, start)
+        if idx >= 0:
+            end_bound = min(end_bound, idx)
+
+    raw = _repair_tool_json_text(text[start:end_bound])
+    if not raw.startswith("{"):
+        return None, start
+
+    candidates = [raw]
+    if raw != text[start:end_bound].strip():
+        candidates.append(text[start:end_bound].strip())
+
+    suffixes = ["", "}", "]}", "]}"] 
+    if raw.endswith("}}}"):
+        suffixes = ["]}", "]}"] + suffixes
+    elif raw.endswith("}}"):
+        suffixes = ["]}", "]}"] + suffixes
+
+    for base in candidates:
+        for suffix in suffixes:
+            try:
+                obj, rel_end = json.JSONDecoder().raw_decode(base + suffix)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj, start + rel_end
+    return None, start
+
+
+def _tool_uses_from_object(obj: dict) -> list[ToolUseBlock]:
+    tool_uses: list[ToolUseBlock] = []
+    for item in obj.get("tool_uses", []):
         name = item.get("name", "")
         if not name:
             continue
@@ -212,24 +359,119 @@ def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
         tool_uses.append(
             ToolUseBlock(id=tid, name=name, input=item.get("input") or {})
         )
+    return tool_uses
 
-    clean = _truncate_hallucinated_turns(
-        (text[: match.start()] + text[match.end() :]).strip()
+
+def _extract_tool_uses_object(text: str) -> tuple[str, list[ToolUseBlock]]:
+    """用 JSONDecoder 解析 {\"tool_uses\":[...]}，避免 content 里的 ] 截断正则。"""
+    tool_uses: list[ToolUseBlock] = []
+    search_from = 0
+    found_span: tuple[int, int] | None = None
+
+    while True:
+        key_idx = text.find('"tool_uses"', search_from)
+        if key_idx < 0:
+            break
+        obj_start = text.rfind("{", 0, key_idx)
+        if obj_start < 0:
+            search_from = key_idx + 1
+            continue
+        obj, end = _decode_json_object_loose(text, obj_start)
+        if not obj or "tool_uses" not in obj:
+            search_from = key_idx + 1
+            continue
+        found_span = (obj_start, end)
+        tool_uses = _tool_uses_from_object(obj)
+        break
+
+    if not tool_uses or not found_span:
+        return text.strip(), []
+
+    start, end = found_span
+    clean = text[:start] + text[end:]
+    clean = re.sub(
+        r"<function_json>\s*</function_json>",
+        "",
+        clean,
+        flags=re.IGNORECASE | re.DOTALL,
     )
+    clean = _truncate_hallucinated_turns(clean.strip())
+    return clean, tool_uses
+
+
+def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
+    """从模型回复中解析 tool_uses JSON，返回 (纯文本, 工具列表)。"""
+    text = _unwrap_tool_markup(_truncate_hallucinated_turns(text))
+
+    clean, tool_uses = _extract_tool_uses_object(text)
     if tool_uses:
         return clean, tool_uses
-    return _extract_bracket_tool_calls(text)
+
+    clean, tool_uses = _extract_bracket_tool_calls(text)
+    if tool_uses:
+        return clean, tool_uses
+
+    clean, tool_uses = _extract_history_tool_calls(text)
+    if tool_uses:
+        return clean, tool_uses
+
+    partial = _extract_write_from_partial_json(text)
+    if partial:
+        json_start = text.find("{")
+        clean = text[:json_start].strip() if json_start >= 0 else ""
+        return clean, partial
+
+    return text.strip(), []
 
 
-def parse_agent_response(raw: str) -> AgentResult:
+def _fallback_write_from_fence(text: str, user_hint: str = "") -> list[ToolUseBlock]:
+    """模型只输出 markdown 代码块时，回退生成 Write 工具调用。"""
+    fence = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if not fence:
+        return []
+    content = fence.group(1).strip()
+    if len(content) < 10:
+        return []
+
+    file_path = "test.py"
+    m = re.search(r"[`'\"]?([\w./_-]+\.py)[`'\"]?", user_hint)
+    if m:
+        file_path = m.group(1).split("/")[-1]
+    else:
+        m2 = re.search(r"[`'\"]?([\w./_-]+\.py)[`'\"]?", text)
+        if m2:
+            file_path = m2.group(1).split("/")[-1]
+
+    return [
+        ToolUseBlock(
+            id=f"toolu_{uuid.uuid4().hex[:12]}",
+            name="Write",
+            input={"file_path": file_path, "content": content},
+        )
+    ]
+
+
+def parse_agent_response(raw: str, *, user_hint: str = "") -> AgentResult:
     text, tool_uses = _extract_json_tool_block(raw)
+    if not tool_uses:
+        tool_uses = _fallback_write_from_fence(text or raw, user_hint)
+        if tool_uses:
+            text = re.sub(r"```(?:python)?\s*\n.*?```", "", text or raw, flags=re.DOTALL | re.IGNORECASE).strip()
     return AgentResult(text=text, tool_uses=tool_uses)
 
 
 def to_anthropic_content(result: AgentResult) -> list[dict]:
     blocks: list[dict] = []
-    if result.text:
-        blocks.append({"type": "text", "text": result.text})
+    text = result.text.strip()
+    if result.tool_uses and text:
+        # 去掉模型附带的 tool JSON，避免 Claude Code 把 JSON 当正文打印
+        for marker in ('{"tool_uses"', '"tool_uses"'):
+            idx = text.find(marker)
+            if idx >= 0:
+                text = text[:idx].strip()
+                break
+    if text:
+        blocks.append({"type": "text", "text": text})
     for tu in result.tool_uses:
         blocks.append(
             {
