@@ -1,13 +1,31 @@
+import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import asyncio
-import time
-from threading import Thread
+
+from doubao_browser import PARAM_FILE, refresh_credentials
 from mitm_addon import cache
 from ws_bridge import send_prompt_to_doubao
 
-app = FastAPI(title="Doubao -> Claude Code 中转API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[startup] 删除旧凭证并重新登录豆包…")
+    PARAM_FILE.unlink(missing_ok=True)
+    try:
+        await refresh_credentials()
+        print(f"[startup] 已写入 {PARAM_FILE}")
+    except Exception as e:
+        print(f"[startup] 凭证获取失败: {e}")
+        print("[startup] 服务仍将启动，首次请求时会重试获取")
+    yield
+
+
+app = FastAPI(title="Doubao -> Claude Code 中转API", lifespan=lifespan)
 
 # 模拟会话ID池
 def get_conv_id() -> str:
@@ -32,14 +50,15 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=400, detail="未检测到用户提问")
 
     conv_id = get_conv_id()
-    # 异步发送提问（不阻塞接口）
-    Thread(target=lambda: asyncio.run(send_prompt_to_doubao(user_prompt, conv_id))).start()
+    await send_prompt_to_doubao(user_prompt, conv_id)
 
-    # 等待流式数据就绪
-    timeout = 0
-    while cache.is_streaming and len(cache.stream_chunks) == 0 and timeout < 20:
-        await asyncio.sleep(0.2)
-        timeout += 1
+    if cache.last_error:
+        raise HTTPException(status_code=502, detail=cache.last_error)
+    if not cache.model_reply:
+        raise HTTPException(
+            status_code=502,
+            detail="豆包未返回内容，请重新运行 python doubao_auth.py 登录",
+        )
 
     # 场景1：流式返回（Claude Code 优先使用流式）
     if req.stream:
@@ -73,6 +92,25 @@ async def chat_completions(req: ChatRequest):
         ]
     }
 
+def _check_deps() -> None:
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        import sys
+        from pathlib import Path
+
+        venv_py = Path(__file__).resolve().parent / "venv" / "bin" / "python"
+        sys.exit(
+            "缺少 playwright。请用项目虚拟环境启动:\n"
+            "  cd free-claude && source venv/bin/activate\n"
+            "  pip install -r requirements.txt && playwright install chromium\n"
+            f"  python trans_api.py\n"
+            f"或直接: {venv_py} trans_api.py"
+        )
+
+
 if __name__ == "__main__":
+    _check_deps()
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=8000)
