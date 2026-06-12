@@ -88,9 +88,10 @@ def build_agent_prompt(
             "- input 必须符合该工具的参数\n"
             "- 可同时输出说明文字 + 一行 JSON\n"
             "- 不需要工具时，只输出普通文字，不要输出 JSON\n"
-            "- 禁止输出 [调用 Write]、[工具 xxx 返回]、### 用户 等格式\n"
-            "- 禁止用 <function_json> 等 XML 标签包裹\n"
-            "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复"
+            "- 禁止输出 [调用 Write]、[已调用 Bash]、[工具 xxx 返回]、### 用户 等格式\n"
+            "- 禁止用 <function_json>、<bash>、<write>、<read> 等 XML 标签\n"
+            "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复\n"
+            "- 每次只调用一个工具，等待结果后再继续"
         )
 
     history: list[str] = []
@@ -117,6 +118,8 @@ def _truncate_hallucinated_turns(text: str) -> str:
         "\n[工具 ",
         "\n[Tool ",
         "\n## 系统提醒",
+        "\n## 总结",
+        "\n完美！",
     ):
         idx = text.find(marker)
         if idx >= 0:
@@ -181,9 +184,9 @@ def _extract_bracket_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
 
 
 def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
-    """解析 [已调用工具 Write id=toolu_xxx input={...}] 格式（模型仿造对话历史）。"""
+    """解析 [已调用 Bash id=... input={...}] / [已调用工具 Write id=...] 等仿造格式。"""
     header = re.compile(
-        r"\[已调用工具\s+(\w+)\s+id=([^\s]+)\s+input=",
+        r"\[(?:已调用(?:工具\s+)?|Called(?:\s+tool)?)\s*(\w+)\s+id=([^\s]+)\s+input=",
         re.IGNORECASE,
     )
     tool_uses: list[ToolUseBlock] = []
@@ -195,6 +198,8 @@ def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
         obj, end = _decode_json_object(text, match.end())
         if not obj or not isinstance(obj, dict):
             continue
+        if end < len(text) and text[end] == "]":
+            end += 1
         if not tid.startswith("toolu_"):
             tid = f"toolu_{tid}"
         tool_uses.append(ToolUseBlock(id=tid, name=name, input=obj))
@@ -210,6 +215,88 @@ def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
         last = end
     clean_parts.append(text[last:])
     return _truncate_hallucinated_turns("".join(clean_parts).strip()), tool_uses
+
+
+def _parse_write_tag_inner(inner: str) -> dict | None:
+    fp_match = re.search(
+        r'file_path:\s*"((?:\\.|[^"\\])*)"',
+        inner,
+        re.IGNORECASE,
+    )
+    if fp_match:
+        try:
+            file_path = json.loads(f'"{fp_match.group(1)}"')
+        except json.JSONDecodeError:
+            file_path = fp_match.group(1)
+    else:
+        fp_match = re.search(r"file_path:\s*(\S+)", inner, re.IGNORECASE)
+        if not fp_match:
+            return None
+        file_path = fp_match.group(1).strip().strip('"')
+
+    content_match = re.search(r"content:\s*", inner, re.IGNORECASE)
+    if not content_match:
+        return None
+    rest = inner[content_match.end() :].lstrip()
+    if not rest.startswith('"'):
+        return None
+    content, _ = _read_json_string(rest, 0)
+    if not content:
+        return None
+    return {"file_path": file_path, "content": content}
+
+
+def _parse_read_tag_inner(inner: str) -> dict | None:
+    fp_match = re.search(
+        r'file_path:\s*"((?:\\.|[^"\\])*)"',
+        inner,
+        re.IGNORECASE,
+    )
+    if fp_match:
+        try:
+            file_path = json.loads(f'"{fp_match.group(1)}"')
+        except json.JSONDecodeError:
+            file_path = fp_match.group(1)
+    else:
+        fp_match = re.search(r"file_path:\s*(\S+)", inner, re.IGNORECASE)
+        if not fp_match:
+            return None
+        file_path = fp_match.group(1).strip().strip('"')
+    return {"file_path": file_path}
+
+
+def _extract_xml_tag_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
+    """解析 <bash>、<write>、<read> 等 DeepSeek 伪 XML 工具格式。"""
+    tag_specs = (
+        (re.compile(r"<bash>\s*(.*?)\s*</bash>", re.DOTALL | re.IGNORECASE), "Bash"),
+        (re.compile(r"<write>\s*(.*?)\s*</write>", re.DOTALL | re.IGNORECASE), "Write"),
+        (re.compile(r"<read>\s*(.*?)\s*</read>", re.DOTALL | re.IGNORECASE), "Read"),
+    )
+    candidates: list[tuple[int, int, str, dict]] = []
+
+    for pattern, tool_name in tag_specs:
+        for match in pattern.finditer(text):
+            inner = match.group(1)
+            if tool_name == "Write":
+                inp = _parse_write_tag_inner(inner)
+            elif tool_name == "Read":
+                inp = _parse_read_tag_inner(inner)
+            else:
+                cmd = inner.strip()
+                if not cmd:
+                    continue
+                inp = {"command": cmd, "description": cmd[:120]}
+            if inp:
+                candidates.append((match.start(), match.end(), tool_name, inp))
+
+    if not candidates:
+        return text.strip(), []
+
+    candidates.sort(key=lambda item: item[0])
+    start, _end, tool_name, inp = candidates[0]
+    clean = _truncate_hallucinated_turns(text[:start].strip())
+    tid = f"toolu_{uuid.uuid4().hex[:12]}"
+    return clean, [ToolUseBlock(id=tid, name=tool_name, input=inp)]
 
 
 def _unwrap_tool_markup(text: str) -> str:
@@ -407,6 +494,10 @@ def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
     if tool_uses:
         return clean, tool_uses
 
+    clean, tool_uses = _extract_xml_tag_tool_calls(text)
+    if tool_uses:
+        return clean, tool_uses
+
     clean, tool_uses = _extract_bracket_tool_calls(text)
     if tool_uses:
         return clean, tool_uses
@@ -457,6 +548,8 @@ def parse_agent_response(raw: str, *, user_hint: str = "") -> AgentResult:
         tool_uses = _fallback_write_from_fence(text or raw, user_hint)
         if tool_uses:
             text = re.sub(r"```(?:python)?\s*\n.*?```", "", text or raw, flags=re.DOTALL | re.IGNORECASE).strip()
+    if len(tool_uses) > 1:
+        tool_uses = tool_uses[:1]
     return AgentResult(text=text, tool_uses=tool_uses)
 
 
@@ -464,8 +557,16 @@ def to_anthropic_content(result: AgentResult) -> list[dict]:
     blocks: list[dict] = []
     text = result.text.strip()
     if result.tool_uses and text:
-        # 去掉模型附带的 tool JSON，避免 Claude Code 把 JSON 当正文打印
-        for marker in ('{"tool_uses"', '"tool_uses"'):
+        # 去掉模型附带的 tool JSON / 仿造调用行，避免 Claude Code 当正文打印
+        for marker in (
+            '{"tool_uses"',
+            '"tool_uses"',
+            "[已调用",
+            "[Called",
+            "<bash>",
+            "<write>",
+            "<read>",
+        ):
             idx = text.find(marker)
             if idx >= 0:
                 text = text[:idx].strip()
