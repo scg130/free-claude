@@ -66,6 +66,15 @@ python deepseek_auth.py
 curl -X POST http://127.0.0.1:8000/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-chat","max_tokens":1024,"messages":[{"role":"user","content":"1+1=?"}]}'
+
+curl -s -X POST http://127.0.0.1:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"deepseek-coder",
+    "max_tokens":4096,
+    "tools":[{"name":"Write","description":"Write file","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}],
+    "messages":[{"role":"user","content":"写一个快速排序到 test.py"}]
+  }'  
 ```
 
 3. 让 Claude Code 使用 DeepSeek：
@@ -132,4 +141,4 @@ mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
 | API 返回 502 | 运行 `python doubao_auth.py` 或 `python deepseek_auth.py` 重新登录 |
 | `Not logged in · Please run /login` | 设置 `ANTHROPIC_API_KEY=sk-any` |
 | 只聊天不写文件 | 重启 `./run.sh` 加载 Tool 桥接；见上文 Agent 章节 |
-| 说了要写但文件没出现 | 豆包未输出 tool JSON，多试几次或换官方 Claude |
+| 说了要写但文件没出现 | 重启 `./run.sh` 加载最新 bridge；DeepSeek 若输出 `[调用 Write]` 现已自动解析为 `tool_use`；写文件需授权或使用 `claude --dangerously-skip-permissions` |
