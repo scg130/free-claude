@@ -45,10 +45,18 @@ python doubao_auth.py
 
 ## 接入 Claude Code
 
+Claude Code 走 **Anthropic API**，不是 OpenAI：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=sk-any
+claude -p "你好豆包 写一个快速排序到test.py"
 ```
-OPENAI_API_BASE=http://127.0.0.1:8000/v1
-OPENAI_API_KEY=sk-any
-```
+
+- 用 `ANTHROPIC_*`，不要用 `OPENAI_*`
+- `ANTHROPIC_BASE_URL` **不要加** `/v1`
+- `ANTHROPIC_API_KEY` 任意非空字符串即可（本地不校验），用于跳过 `Not logged in · Please run /login`
+- 修改代码后需 **重启** `./run.sh`；可用 `curl -I http://127.0.0.1:8000/` 确认服务已更新（应返回 200）
 
 ## 备选：mitmproxy 抓包
 
@@ -65,3 +73,4 @@ WS 参数保存至 `params/doubao/ws_params.json`。
 | 弹出浏览器要求登录 | 首次正常，登录后自动继续 |
 | `未知模型` | 查看 `GET /v1/models` 支持的 model 列表 |
 | API 返回 502 | 运行 `python doubao_auth.py` 重新登录 |
+| `Not logged in · Please run /login` | 设置 `ANTHROPIC_API_KEY=sk-any`，不要用 `OPENAI_API_KEY` |
