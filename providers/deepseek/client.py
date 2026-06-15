@@ -4,8 +4,8 @@ import json
 
 from config import APP
 from providers.anthropic_bridge import (
-    build_agent_prompt,
-    parse_agent_response,
+    extract_user_text,
+    run_agent_parse_loop,
     to_anthropic_content,
 )
 from providers.base import ChatResult
@@ -162,12 +162,19 @@ async def chat_agent(
     project_context: str = "",
 ) -> ChatResult:
     if tools:
-        prompt = build_agent_prompt(
-            messages, system, tools, project_context=project_context
+        user_hint = extract_user_text(messages)
+
+        async def fetch_raw(prompt: str) -> str:
+            return await _web_completion(prompt, model=model)
+
+        agent = await run_agent_parse_loop(
+            fetch_raw,
+            messages=messages,
+            system=system,
+            tools=tools,
+            project_context=project_context,
+            user_hint=user_hint,
         )
-        user_hint = _extract_user_text(messages)
-        raw = await _web_completion(prompt, model=model)
-        agent = parse_agent_response(raw, user_hint=user_hint)
         blocks = to_anthropic_content(agent)
         return ChatResult.from_blocks(blocks, stop_reason=agent.stop_reason)
 

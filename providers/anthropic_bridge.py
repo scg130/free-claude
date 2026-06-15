@@ -168,6 +168,67 @@ def build_qa_user_prompt(user_text: str, context: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def extract_user_text(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and content:
+            return content
+        if isinstance(content, list):
+            parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            if parts:
+                return "".join(parts)
+    return ""
+
+
+_TOOL_RETRY_SUFFIX = (
+    "\n\n## 系统提醒\n"
+    "上次回复未包含合法 tool JSON（`{\"tool_uses\":[...]}`）。"
+    "若需读文件、写文件或执行命令，必须在回复**末尾单独一行**输出工具 JSON。"
+    "不要只用文字描述操作。"
+)
+
+
+async def run_agent_parse_loop(
+    fetch_raw,
+    *,
+    messages: list[dict],
+    system: str | list | None,
+    tools: list[dict],
+    project_context: str = "",
+    user_hint: str = "",
+    max_attempts: int | None = None,
+) -> AgentResult:
+    """调用 LLM 并解析 tool_use；解析失败时重试（默认 RETRY_MAX 次）。"""
+    from config import APP
+
+    attempts = max(1, max_attempts or APP.retry_max)
+    base_prompt = build_agent_prompt(messages, system, tools, project_context=project_context)
+    last_raw = ""
+    agent = AgentResult()
+
+    for attempt in range(1, attempts + 1):
+        prompt = base_prompt if attempt == 1 else base_prompt + _TOOL_RETRY_SUFFIX
+        if attempt > 1:
+            print(f"[bridge] 未解析到 tool_use，第 {attempt}/{attempts} 次重试…")
+        last_raw = await fetch_raw(prompt)
+        agent = parse_agent_response(last_raw, user_hint=user_hint, log_if_missing=False)
+        if agent.tool_uses:
+            return agent
+
+    if last_raw.strip():
+        preview = last_raw.strip().replace("\n", " ")[:120]
+        print(
+            f"[bridge] 未解析到 tool_use（已重试 {attempts} 次），将作为纯文本返回: {preview}…"
+        )
+    return agent
+
+
 def _truncate_hallucinated_turns(text: str) -> str:
     """截断模型编造的多轮对话（### 用户、[工具 xxx 返回] 等）。"""
     for marker in (
@@ -659,7 +720,9 @@ def _fallback_write_from_fence(text: str, user_hint: str = "") -> list[ToolUseBl
     ]
 
 
-def parse_agent_response(raw: str, *, user_hint: str = "") -> AgentResult:
+def parse_agent_response(
+    raw: str, *, user_hint: str = "", log_if_missing: bool = True
+) -> AgentResult:
     text, tool_uses = _extract_json_tool_block(raw)
     if not tool_uses:
         tool_uses = _fallback_write_from_fence(text or raw, user_hint)
@@ -667,7 +730,7 @@ def parse_agent_response(raw: str, *, user_hint: str = "") -> AgentResult:
             text = re.sub(r"```(?:python)?\s*\n.*?```", "", text or raw, flags=re.DOTALL | re.IGNORECASE).strip()
     if len(tool_uses) > 1:
         tool_uses = tool_uses[:1]
-    if not tool_uses and raw.strip():
+    if not tool_uses and raw.strip() and log_if_missing:
         preview = raw.strip().replace("\n", " ")[:120]
         print(f"[bridge] 未解析到 tool_use，将作为纯文本返回: {preview}…")
     return AgentResult(text=text, tool_uses=tool_uses)

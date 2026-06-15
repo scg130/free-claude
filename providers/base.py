@@ -65,12 +65,30 @@ class ChatProvider(ABC):
         project_context: str = "",
     ) -> ChatResult:
         """Agent 模式：支持 tools 时默认走 chat（子类可覆盖）。"""
-        from providers.anthropic_bridge import build_agent_prompt, parse_agent_response, to_anthropic_content
+        from providers.anthropic_bridge import (
+            build_agent_prompt,
+            extract_user_text,
+            run_agent_parse_loop,
+            to_anthropic_content,
+        )
 
-        prompt = build_agent_prompt(messages, system, tools, project_context=project_context)
-        raw = await self.chat(prompt, conv_id)
         if not tools:
-            return raw
-        agent = parse_agent_response(raw.content)
+            prompt = build_agent_prompt(messages, system, tools, project_context=project_context)
+            return await self.chat(prompt, conv_id)
+
+        user_hint = extract_user_text(messages)
+
+        async def fetch_raw(prompt: str) -> str:
+            result = await self.chat(prompt, conv_id)
+            return result.content
+
+        agent = await run_agent_parse_loop(
+            fetch_raw,
+            messages=messages,
+            system=system,
+            tools=tools,
+            project_context=project_context,
+            user_hint=user_hint,
+        )
         blocks = to_anthropic_content(agent)
         return ChatResult.from_blocks(blocks, stop_reason=agent.stop_reason)
