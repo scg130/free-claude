@@ -17,6 +17,12 @@ class DeepSeekProvider(ChatProvider):
         if refresh_credentials or not browser.session_ready():
             await browser.refresh_credentials()
         await browser.ensure_runtime_page()
+        try:
+            from providers.deepseek.pow import get_solver
+            get_solver().warmup()
+            print("[deepseek] PoW WASM 已预热")
+        except Exception as e:
+            print(f"[deepseek] PoW 预热跳过: {e}")
 
     async def shutdown(self) -> None:
         await browser.shutdown()

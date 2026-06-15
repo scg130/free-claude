@@ -59,6 +59,19 @@ def _tool_summary(tools: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _truncate_text(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…(已截断)"
+
+
+def _trim_message_for_prompt(text: str) -> str:
+    if "[工具 " in text or "[Tool " in text or "tool_result" in text.lower():
+        return _truncate_text(text, 1500)
+    return _truncate_text(text, 6000)
+
+
 def build_agent_prompt(
     messages: list[dict],
     system: str | list | None,
@@ -74,11 +87,11 @@ def build_agent_prompt(
 
     if system:
         if isinstance(system, str):
-            sections.append(f"## 系统指令\n{system}")
+            sections.append(f"## 系统指令\n{_truncate_text(system, 3000)}")
         elif isinstance(system, list):
             sys_text = _block_text(system)
             if sys_text:
-                sections.append(f"## 系统指令\n{sys_text}")
+                sections.append(f"## 系统指令\n{_truncate_text(sys_text, 3000)}")
 
     if tools:
         sections.append(
@@ -94,15 +107,16 @@ def build_agent_prompt(
             "- 可同时输出说明文字 + 一行 JSON\n"
             "- 不需要工具时，只输出普通文字，不要输出 JSON\n"
             "- 禁止输出 [调用 Write]、[已调用 Bash]、[工具 xxx 返回]、### 用户 等格式\n"
-            "- 禁止用 <function_json>、<bash>、<write>、<read> 等 XML 标签\n"
+            "- 禁止用 <function_json>、<bash>、<write>、<read>、<tool_call> 等 XML 标签\n"
             "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复\n"
             "- 每次只调用一个工具，等待结果后再继续"
         )
 
     history: list[str] = []
-    for msg in messages:
+    recent = messages[-8:] if len(messages) > 8 else messages
+    for msg in recent:
         role = msg.get("role", "user")
-        text = _block_text(msg.get("content", ""))
+        text = _trim_message_for_prompt(_block_text(msg.get("content", "")))
         if not text:
             continue
         label = {"user": "用户", "assistant": "助手"}.get(role, role)
@@ -189,15 +203,19 @@ def _extract_bracket_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
 
 
 def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
-    """解析 [已调用 Bash id=... input={...}] / [已调用工具 Write id=...] 等仿造格式。"""
-    header = re.compile(
+    """解析 [已调用 Bash id=...] / [已调用工具 Read]{...} 等仿造格式。"""
+    header_with_id = re.compile(
         r"\[(?:已调用(?:工具\s+)?|Called(?:\s+tool)?)\s*(\w+)\s+id=([^\s]+)\s+input=",
+        re.IGNORECASE,
+    )
+    header_short = re.compile(
+        r"\[(?:已调用(?:工具\s+)?|Called(?:\s+tool)?)\s*(\w+)\]\s*",
         re.IGNORECASE,
     )
     tool_uses: list[ToolUseBlock] = []
     spans: list[tuple[int, int]] = []
 
-    for match in header.finditer(text):
+    for match in header_with_id.finditer(text):
         name = match.group(1)
         tid = match.group(2)
         obj, end = _decode_json_object(text, match.end())
@@ -209,6 +227,18 @@ def _extract_history_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
             tid = f"toolu_{tid}"
         tool_uses.append(ToolUseBlock(id=tid, name=name, input=obj))
         spans.append((match.start(), end))
+
+    if not tool_uses:
+        for match in header_short.finditer(text):
+            name = match.group(1)
+            obj, end = _decode_json_object(text, match.end())
+            if not obj or not isinstance(obj, dict):
+                continue
+            if end < len(text) and text[end] == "]":
+                end += 1
+            tid = f"toolu_{uuid.uuid4().hex[:12]}"
+            tool_uses.append(ToolUseBlock(id=tid, name=name, input=obj))
+            spans.append((match.start(), end))
 
     if not tool_uses:
         return text.strip(), []
@@ -304,8 +334,46 @@ def _extract_xml_tag_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
     return clean, [ToolUseBlock(id=tid, name=tool_name, input=inp)]
 
 
+def _parse_tool_call_inner(inner: str) -> dict | None:
+    inner = inner.strip()
+    args_match = re.search(
+        r"<arguments>\s*(.*?)\s*</arguments>",
+        inner,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if args_match:
+        inner = args_match.group(1).strip()
+    obj, _ = _decode_json_object_loose(inner, inner.find("{"))
+    if obj and isinstance(obj, dict):
+        return obj
+    return None
+
+
+def _extract_tool_call_tag_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
+    """解析 <tool_call name=\"Read\">{...}</tool_call> / <arguments> 格式。"""
+    pattern = re.compile(
+        r'<tool_call\s+name="([^"]+)"\s*>\s*(.*?)\s*</tool_call>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    candidates: list[tuple[int, int, str, dict]] = []
+    for match in pattern.finditer(text):
+        name = match.group(1).strip()
+        inp = _parse_tool_call_inner(match.group(2))
+        if name and inp:
+            candidates.append((match.start(), match.end(), name, inp))
+
+    if not candidates:
+        return text.strip(), []
+
+    candidates.sort(key=lambda item: item[0])
+    start, _end, tool_name, inp = candidates[0]
+    clean = _truncate_hallucinated_turns(text[:start].strip())
+    tid = f"toolu_{uuid.uuid4().hex[:12]}"
+    return clean, [ToolUseBlock(id=tid, name=tool_name, input=inp)]
+
+
 def _unwrap_tool_markup(text: str) -> str:
-    """去掉 <function_json>、<tool_call> 等包裹，保留内部 JSON。"""
+    """去掉 <function_json> 包裹，保留内部 JSON（不处理 <tool_call>，由专用解析器处理）。"""
     text = re.sub(
         r"<function_json>\s*",
         "",
@@ -313,8 +381,6 @@ def _unwrap_tool_markup(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\s*</function_json>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<tool_call>\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*</tool_call>", "", text, flags=re.IGNORECASE)
     return text
 
 
@@ -493,7 +559,13 @@ def _extract_tool_uses_object(text: str) -> tuple[str, list[ToolUseBlock]]:
 
 def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
     """从模型回复中解析 tool_uses JSON，返回 (纯文本, 工具列表)。"""
-    text = _unwrap_tool_markup(_truncate_hallucinated_turns(text))
+    text = _truncate_hallucinated_turns(text)
+
+    clean, tool_uses = _extract_tool_call_tag_tool_calls(text)
+    if tool_uses:
+        return clean, tool_uses
+
+    text = _unwrap_tool_markup(text)
 
     clean, tool_uses = _extract_tool_uses_object(text)
     if tool_uses:
@@ -571,6 +643,7 @@ def to_anthropic_content(result: AgentResult) -> list[dict]:
             "<bash>",
             "<write>",
             "<read>",
+            "<tool_call",
         ):
             idx = text.find(marker)
             if idx >= 0:

@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -27,6 +28,9 @@ _cdp_browser: Browser | None = None
 _via_cdp = False
 _captured_auth: str = ""
 _captured_hif_leim: str = ""
+_cached_session_id: str = ""
+_cached_session_at: float = 0.0
+_SESSION_TTL_SEC = 300
 
 _PROFILE_IN_USE_MSG = (
     "DeepSeek 浏览器配置目录已被占用（.profiles/deepseek）。"
@@ -432,6 +436,35 @@ async (args) => {
     return h;
   }
   try {
+    if (args.step === 'session_and_pow') {
+      const createRes = await fetch(base + '/chat_session/create', {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: '{}',
+        credentials: 'include',
+        signal: AbortSignal.timeout(180000),
+      });
+      const createData = await createRes.json();
+      if (!createRes.ok || createData.code !== 0) {
+        return { error: 'create_session', status: createRes.status, detail: JSON.stringify(createData) };
+      }
+      const biz = createData.data.biz_data;
+      const sessionId = biz.id || (biz.chat_session && biz.chat_session.id);
+      const powRes = await fetch(base + '/chat/create_pow_challenge', {
+        method: 'POST',
+        headers: apiHeaders({
+          referer: 'https://chat.deepseek.com/a/chat/s/' + sessionId,
+        }),
+        body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
+        credentials: 'include',
+        signal: AbortSignal.timeout(180000),
+      });
+      const powData = await powRes.json();
+      if (!powRes.ok || powData.code !== 0) {
+        return { error: 'pow_challenge', status: powRes.status, detail: JSON.stringify(powData) };
+      }
+      return { session_id: sessionId, challenge: powData.data.biz_data.challenge };
+    }
     if (args.step === 'create_session') {
       const res = await fetch(base + '/chat_session/create', {
         method: 'POST',
@@ -506,6 +539,33 @@ async def ensure_runtime_page() -> Page:
         return await _ensure_page(headless=True)
 
 
+async def _invalidate_session_cache() -> None:
+    global _cached_session_id, _cached_session_at
+    _cached_session_id = ""
+    _cached_session_at = 0.0
+
+
+async def _session_and_pow(page: Page, fetch_args: dict) -> dict:
+    global _cached_session_id, _cached_session_at
+    reuse = os.environ.get("DEEPSEEK_REUSE_SESSION", "1").lower() not in ("0", "false", "no")
+    now = time.time()
+    if reuse and _cached_session_id and now - _cached_session_at < _SESSION_TTL_SEC:
+        pow_res = await page.evaluate(
+            JS_FETCH,
+            {**fetch_args, "step": "pow_challenge", "session_id": _cached_session_id},
+        )
+        if not pow_res.get("error"):
+            return {"session_id": _cached_session_id, "challenge": pow_res["challenge"]}
+
+    combined = await page.evaluate(JS_FETCH, {**fetch_args, "step": "session_and_pow"})
+    if combined.get("error"):
+        await _invalidate_session_cache()
+        return combined
+    _cached_session_id = combined["session_id"]
+    _cached_session_at = now
+    return combined
+
+
 async def chat_via_browser(
     prompt: str,
     *,
@@ -515,6 +575,9 @@ async def chat_via_browser(
     """在浏览器上下文中调用 DeepSeek API（自动携带 authorization / x-hif-leim / cookies）。"""
     from providers.deepseek.pow import PowChallenge, get_solver
 
+    t0 = time.perf_counter()
+    prompt_chars = len(prompt)
+
     async with _browser_lock:
         page = await _ensure_page(headless=True)
         if "deepseek.com" not in page.url:
@@ -523,18 +586,13 @@ async def chat_via_browser(
 
         fetch_args = await _fetch_args(page)
 
-        sess = await page.evaluate(JS_FETCH, {**fetch_args, "step": "create_session"})
-        if sess.get("error"):
-            return sess
+        sp = await _session_and_pow(page, fetch_args)
+        if sp.get("error"):
+            return sp
+        session_id = sp["session_id"]
+        raw = sp["challenge"]
+        t1 = time.perf_counter()
 
-        session_id = sess["session_id"]
-        pow_res = await page.evaluate(
-            JS_FETCH, {**fetch_args, "step": "pow_challenge", "session_id": session_id}
-        )
-        if pow_res.get("error"):
-            return pow_res
-
-        raw = pow_res["challenge"]
         challenge = PowChallenge(
             algorithm=raw["algorithm"],
             challenge=raw["challenge"],
@@ -545,6 +603,7 @@ async def chat_via_browser(
             target_path=raw["target_path"],
         )
         pow_header = get_solver().build_header(challenge)
+        t2 = time.perf_counter()
 
         body = json.dumps(
             {
@@ -561,7 +620,7 @@ async def chat_via_browser(
             ensure_ascii=False,
         )
 
-        return await page.evaluate(
+        result = await page.evaluate(
             JS_FETCH,
             {
                 **fetch_args,
@@ -571,6 +630,15 @@ async def chat_via_browser(
                 "body": body,
             },
         )
+        t3 = time.perf_counter()
+        if result.get("auth_error"):
+            await _invalidate_session_cache()
+        print(
+            f"[deepseek] prompt={prompt_chars} chars | "
+            f"session+pow={t1 - t0:.1f}s solve={t2 - t1:.1f}s "
+            f"completion={t3 - t2:.1f}s total={t3 - t0:.1f}s"
+        )
+        return result
 
 
 async def shutdown() -> None:

@@ -79,7 +79,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/messages \
 
 3. Agent 写文件（需授权 + 重启 `./run.sh` 加载最新 bridge）：
 
-**项目上下文（自动）：** 在**你的项目目录**下运行 `claude`（`cd your-project && claude`），会从 Claude Code 的 system 里读取 **working directory**，自动注入该目录源码（**不是** free-claude 安装目录）。
+**项目上下文（自动）：** 在**你的项目目录**下运行 `claude`（`cd your-project && claude`），会从 Claude Code 的 system 里读取 **working directory**，自动注入该目录信息（**不是** free-claude 安装目录）。
 
 ```bash
 cd /path/to/your-project          # 你的项目
@@ -88,12 +88,56 @@ export ANTHROPIC_API_KEY=sk-any
 claude --model deepseek-coder --permission-mode bypassPermissions -p "写一个快速排序到 test.py"
 ```
 
+### 重启代理
+
+改代码或更新配置后，需重启中转服务：
+
+```bash
+cd /path/to/free-claude
+./run.sh
+# 等到: Uvicorn running on http://127.0.0.1:8000
+```
+
+### 加速与项目上下文（推荐）
+
+DeepSeek 走网页 API + PoW，**每轮工具调用都要 30s～90s**。可通过环境变量控制注入到 prompt 的项目信息量：
+
+**最快（推荐，已有 codegraph / Read 工具）：**
+
+```bash
+export FREE_CLAUDE_CONTEXT_MODE=tree    # 默认已是 tree，仅注入目录树
+export FREE_CLAUDE_CONTEXT=0            # 完全关闭项目注入，最快
+```
+
+**默认（平衡）：**
+
+```bash
+export FREE_CLAUDE_CONTEXT_MODE=tree    # 仅文件列表，代码用 Read/MCP 按需读取
+```
+
+**需要完整源码时再开：**
+
+```bash
+export FREE_CLAUDE_CONTEXT=1
+export FREE_CLAUDE_CONTEXT_MODE=full
+export FREE_CLAUDE_CONTEXT_MAX_CHARS=30000
+```
+
 | 环境变量 | 说明 |
 |----------|------|
 | `FREE_CLAUDE_PROJECT_ROOT` | 可选，手动指定项目根（默认从 Claude Code 工作目录自动识别） |
-| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入 |
-| `FREE_CLAUDE_CONTEXT_ALWAYS=1` | 每轮 API 都重新扫描（默认仅会话首轮） |
-| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限，默认 80000 |
+| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入（最快） |
+| `FREE_CLAUDE_CONTEXT=1` | 开启注入（默认） |
+| `FREE_CLAUDE_CONTEXT_MODE` | `tree`（默认，仅目录树）/ `lite`（目录树 + README 等关键文件）/ `full`（尽量注入全部源码） |
+| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限；`full` 模式默认 20000，建议 30000 |
+| `FREE_CLAUDE_CONTEXT_ALWAYS=1` | 每轮 API 都重新扫描项目（默认仅会话首轮） |
+
+重启 `./run.sh` 后，终端会打印耗时日志，便于排查慢在哪一步：
+
+```
+[deepseek] prompt=1234 chars | session+pow=2.1s solve=0.3s completion=45.2s total=47.6s
+[context] 已注入项目上下文: /path/to/project (786 chars)
+```
 
 `-p` 会执行工具，但必须加 `--permission-mode bypassPermissions`（或 `--dangerously-skip-permissions`），否则 Write 不会落盘。
 
@@ -155,3 +199,31 @@ mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
 | 只聊天不写文件 | 重启 `./run.sh` 加载 Tool 桥接；见上文 Agent 章节 |
 | 说了要写但文件没出现 | 重启 `./run.sh` 加载最新 bridge；DeepSeek 若输出 `[调用 Write]` 现已自动解析为 `tool_use`；写文件需授权或使用 `claude --dangerously-skip-permissions` |
 | DeepSeek 浏览器被占用（WSL/Linux） | 重新运行 `./run.sh`；系统依赖有问题时：`./run.sh --reinstall-system-deps` |
+| 回复很慢（1 分钟+） | 正常：每轮工具调用都要走 DeepSeek 网页 API + PoW；已默认 `FREE_CLAUDE_CONTEXT_MODE=tree` 减小 prompt；重启 `./run.sh` 后看日志 `[deepseek] prompt=... total=...s` |
+
+## Claude Code 配置示例
+
+`~/.claude/settings.json`：
+
+```json
+{
+  "model": "deepseek-coder",
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+    "ANTHROPIC_API_KEY": "sk-any"
+  },
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__codegraph_explore",
+      "mcp__codegraph__codegraph_search",
+      "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_callers",
+      "mcp__codegraph__codegraph_callees",
+      "mcp__codegraph__codegraph_impact",
+      "mcp__codegraph__codegraph_files",
+      "mcp__codegraph__codegraph_status"
+    ]
+  }
+}
+```

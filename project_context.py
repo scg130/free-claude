@@ -65,9 +65,13 @@ _ABS_PATH = re.compile(
 
 def _max_chars() -> int:
     try:
-        return max(8_000, int(os.environ.get("FREE_CLAUDE_CONTEXT_MAX_CHARS", "80000")))
+        return max(4_000, int(os.environ.get("FREE_CLAUDE_CONTEXT_MAX_CHARS", "20000")))
     except ValueError:
-        return 80_000
+        return 20_000
+
+
+def _context_mode() -> str:
+    return os.environ.get("FREE_CLAUDE_CONTEXT_MODE", "tree").strip().lower()
 
 
 def _max_file_bytes() -> int:
@@ -291,24 +295,49 @@ def _build_tree(root: Path, files: list[Path]) -> str:
 
 
 def build_project_context(root: Path) -> str:
-    """生成项目目录树 + 源码正文（有总长度上限）。"""
+    """生成项目上下文。默认 tree 模式（仅目录树，用 Read/MCP 读文件）。"""
     root = root.resolve()
     files = _iter_source_files(root)
     if not files:
         return ""
 
-    max_chars = _max_chars()
-    parts = [
+    mode = _context_mode()
+    tree = _build_tree(root, files)
+    header = (
         f"## 当前项目代码库\n"
         f"根目录: {root}\n"
-        f"请基于以下已有代码进行修改/扩展，保持项目风格一致。\n\n"
-        f"### 文件列表\n{_build_tree(root, files)}\n",
-    ]
-    used = sum(len(p) for p in parts)
+        f"请用 Read / MCP 工具按需读取文件，不要假设未读到的代码。\n\n"
+        f"### 文件列表\n{tree}\n"
+    )
+
+    if mode == "tree":
+        return header
+
+    max_chars = _max_chars()
+    parts = [header]
+    used = len(header)
+
+    if mode == "lite":
+        parts.append("### 关键文件\n")
+        used += len(parts[-1])
+        key_names = ("README.md", "readme.md", "main.py", "trans_api.py", "app.py")
+        for name in key_names:
+            path = root / name
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")[:8000]
+            except OSError:
+                continue
+            block = f"\n--- {name} ---\n{text.rstrip()}\n"
+            if used + len(block) > max_chars:
+                break
+            parts.append(block)
+            used += len(block)
+        return "".join(parts)
 
     parts.append("### 源码内容\n")
     used += len(parts[-1])
-
     included = 0
     for path in files:
         rel = path.relative_to(root).as_posix()
@@ -327,8 +356,8 @@ def build_project_context(root: Path) -> str:
         used += len(block)
         included += 1
 
-    if included == 0:
-        return ""
+    if included == 0 and mode == "full":
+        return header
     return "".join(parts)
 
 
