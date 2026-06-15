@@ -7,9 +7,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from project_context import maybe_project_context
+from project_context import is_conversation_start, resolve_request_context
 
 from providers import get_provider, list_models, shutdown_all, startup_all
+from providers.anthropic_bridge import build_qa_user_prompt, is_qa_request
 from providers.doubao.browser import session_ready as doubao_session_ready
 from providers.deepseek.browser import session_ready as deepseek_session_ready
 
@@ -71,24 +72,33 @@ async def _run_chat(
 ) -> tuple[Any, str]:
     provider = get_provider(_resolve_model(model))
     conv_id = get_conv_id()
-    project_context = maybe_project_context(messages, system, tools)
+    user_text = _extract_user_text(messages)
 
-    if tools:
+    # 交互模式：Claude Code 总是带 tools，但问答类首轮走纯聊天（与 -p 一致）
+    effective_tools = tools
+    if tools and user_text and is_qa_request(user_text) and is_conversation_start(messages):
+        print(f"[agent] 问答模式（跳过 tools）: {user_text[:80]}")
+        effective_tools = None
+
+    project_context = resolve_request_context(
+        messages, system, user_text, for_qa=not effective_tools
+    )
+
+    if effective_tools:
         result = await provider.chat_agent(
             messages,
             conv_id,
             system=system,
-            tools=tools,
+            tools=effective_tools,
             model=model,
             project_context=project_context,
         )
     else:
-        user_prompt = _extract_user_text(messages)
-        if not user_prompt:
+        if not user_text:
             raise HTTPException(status_code=400, detail="未检测到用户提问")
-        if project_context:
-            user_prompt = f"{project_context}\n\n## 用户问题\n{user_prompt}"
-        result = await provider.chat(user_prompt, conv_id)
+        result = await provider.chat(
+            build_qa_user_prompt(user_text, project_context), conv_id
+        )
 
     if not result.content and not result.content_blocks:
         raise HTTPException(status_code=502, detail=f"{provider.display_name} 未返回内容")

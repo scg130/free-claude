@@ -72,6 +72,27 @@ def _trim_message_for_prompt(text: str) -> str:
     return _truncate_text(text, 6000)
 
 
+def is_qa_request(user_text: str) -> bool:
+    """问答/解释类请求：交互模式应直接文字回答，不走 Agent tools。"""
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    action_markers = (
+        "写", "创建", "新建", "修改", "删除", "运行", "执行", "修复", "实现", "添加",
+        "write ", "create ", "fix ", "implement", "run ", "mkdir", "npm ", "git ",
+        ".py", ".go", ".ts", ".js", "test.py", "到 test", "到test",
+    )
+    if any(m in text for m in action_markers):
+        return False
+    qa_markers = (
+        "区别", "差异", "是什么", "什么是", "干嘛", "干啥", "怎么用", "如何使用",
+        "为什么", "解释", "说明", "对比", "比较", "有哪些", "什么意思", "介绍一下",
+        "分析", "梳理", "总结",
+        "what ", "difference", "explain", "how does", "why ", "compare",
+    )
+    return any(m in text for m in qa_markers)
+
+
 def build_agent_prompt(
     messages: list[dict],
     system: str | list | None,
@@ -107,7 +128,9 @@ def build_agent_prompt(
             "- 可同时输出说明文字 + 一行 JSON\n"
             "- 不需要工具时，只输出普通文字，不要输出 JSON\n"
             "- 禁止输出 [调用 Write]、[已调用 Bash]、[工具 xxx 返回]、### 用户 等格式\n"
-            "- 禁止用 <function_json>、<bash>、<write>、<read>、<tool_call> 等 XML 标签\n"
+            "- 禁止用 <function_json>、<bash>、<bash_command>、<write>、<read>、<tool_call> 等 XML 标签\n"
+            "- 禁止说「让我先搜索/读取/查看代码库」却不输出工具 JSON\n"
+            "- 问答/对比/解释类问题：直接用文字完整回答，不要调用工具\n"
             "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复\n"
             "- 每次只调用一个工具，等待结果后再继续"
         )
@@ -125,8 +148,24 @@ def build_agent_prompt(
     if history:
         sections.append("## 对话历史\n" + "\n\n".join(history))
 
-    sections.append("## 请继续\n请根据对话完成用户最新请求。需要操作文件或命令时使用工具 JSON。")
+    sections.append("## 请继续\n请结合上方项目代码库完成用户最新请求。需要操作文件或命令时使用工具 JSON。")
     return "\n\n".join(sections)
+
+
+_QA_INSTRUCTION = (
+    "你是项目开发助手。下方附带了当前项目的代码库信息。\n"
+    "必须结合该项目代码与架构回答，不要给出与项目无关的通用科普。\n"
+    "禁止说「我无法访问你的项目/代码/文档」。\n"
+)
+
+
+def build_qa_user_prompt(user_text: str, context: str = "") -> str:
+    """问答模式：带项目上下文与回答约束的单轮 prompt。"""
+    parts = [_QA_INSTRUCTION.strip()]
+    if context:
+        parts.append(context.strip())
+    parts.append(f"## 用户问题\n{user_text.strip()}")
+    return "\n\n".join(parts)
 
 
 def _truncate_hallucinated_turns(text: str) -> str:
@@ -303,6 +342,7 @@ def _parse_read_tag_inner(inner: str) -> dict | None:
 def _extract_xml_tag_tool_calls(text: str) -> tuple[str, list[ToolUseBlock]]:
     """解析 <bash>、<write>、<read> 等 DeepSeek 伪 XML 工具格式。"""
     tag_specs = (
+        (re.compile(r"<bash_command>\s*(.*?)\s*</bash_command>", re.DOTALL | re.IGNORECASE), "Bash"),
         (re.compile(r"<bash>\s*(.*?)\s*</bash>", re.DOTALL | re.IGNORECASE), "Bash"),
         (re.compile(r"<write>\s*(.*?)\s*</write>", re.DOTALL | re.IGNORECASE), "Write"),
         (re.compile(r"<read>\s*(.*?)\s*</read>", re.DOTALL | re.IGNORECASE), "Read"),
@@ -641,6 +681,7 @@ def to_anthropic_content(result: AgentResult) -> list[dict]:
             "[已调用",
             "[Called",
             "<bash>",
+            "<bash_command>",
             "<write>",
             "<read>",
             "<tool_call",

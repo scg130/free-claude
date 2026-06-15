@@ -1,4 +1,8 @@
-"""扫描工作区源码，供 Agent prompt 注入项目上下文。"""
+"""扫描工作区源码，供 Agent prompt 注入项目上下文。
+
+项目目录：每次 API 请求从 Claude Code 的 system prompt 自动解析 working directory。
+服务端（run.sh）只通过 CONTEXT* 环境变量控制是否注入、注入多少，不知道用户在哪个项目。
+"""
 
 import os
 import re
@@ -7,7 +11,6 @@ from pathlib import Path
 from paths import ROOT_DIR
 
 PROXY_DIR = ROOT_DIR.resolve()
-CACHED_ROOT_FILE = PROXY_DIR / ".cache" / "active-project-root.txt"
 
 DEFAULT_IGNORE_DIRS = frozenset({
     ".git",
@@ -63,26 +66,30 @@ _ABS_PATH = re.compile(
 )
 
 
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
+
 def _max_chars() -> int:
     try:
-        return max(4_000, int(os.environ.get("FREE_CLAUDE_CONTEXT_MAX_CHARS", "20000")))
+        return max(4_000, int(_env("CONTEXT_MAX_CHARS", "20000")))
     except ValueError:
         return 20_000
 
 
 def _context_mode() -> str:
-    return os.environ.get("FREE_CLAUDE_CONTEXT_MODE", "tree").strip().lower()
+    return _env("CONTEXT_MODE", "tree").strip().lower()
 
 
 def _max_file_bytes() -> int:
     try:
-        return max(1_024, int(os.environ.get("FREE_CLAUDE_CONTEXT_MAX_FILE_BYTES", "51200")))
+        return max(1_024, int(_env("CONTEXT_MAX_FILE_BYTES", "51200")))
     except ValueError:
         return 51_200
 
 
 def _ignore_dirs() -> frozenset[str]:
-    extra = os.environ.get("FREE_CLAUDE_CONTEXT_IGNORE", "")
+    extra = _env("CONTEXT_IGNORE", "")
     names = {x.strip() for x in extra.split(",") if x.strip()}
     return DEFAULT_IGNORE_DIRS | names
 
@@ -176,31 +183,6 @@ def _guess_from_absolute_paths(text: str) -> Path | None:
     return best
 
 
-def _clear_cached_root() -> None:
-    try:
-        CACHED_ROOT_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _load_cached_root() -> Path | None:
-    try:
-        raw = CACHED_ROOT_FILE.read_text(encoding="utf-8").strip()
-        return _normalize_path(raw)
-    except OSError:
-        return None
-
-
-def _save_cached_root(path: Path) -> None:
-    if _is_proxy_install_dir(path):
-        return
-    try:
-        CACHED_ROOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CACHED_ROOT_FILE.write_text(str(path.resolve()), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _parse_cwd_from_text(text: str) -> Path | None:
     for pattern in _CWD_PATTERNS:
         for match in pattern.finditer(text):
@@ -212,8 +194,7 @@ def _parse_cwd_from_text(text: str) -> Path | None:
             except OSError:
                 continue
             if _is_proxy_install_dir(resolved):
-                _clear_cached_root()
-                return None
+                return resolved
             path = _normalize_path(raw)
             if path:
                 return path
@@ -224,28 +205,15 @@ def resolve_project_root(
     system: str | list | None = None,
     messages: list[dict] | None = None,
 ) -> Path | None:
-    """解析用户项目根目录：Claude Code 工作目录，而非 free-claude 安装目录。"""
-    env_root = os.environ.get("FREE_CLAUDE_PROJECT_ROOT", "").strip()
-    if env_root:
-        path = _normalize_path(env_root, allow_proxy=True)
-        if path:
-            _save_cached_root(path)
-            return path
-        print(f"[context] FREE_CLAUDE_PROJECT_ROOT 无效: {env_root}")
-
+    """从 Claude Code 请求的 system / messages 解析工作目录（不由 run.sh 服务端指定）。"""
     blob = _collect_prompt_texts(system, messages)
-    if blob:
-        parsed = _parse_cwd_from_text(blob)
-        if parsed:
-            _save_cached_root(parsed)
-            return parsed
-        if any(p.search(blob) for p in _CWD_PATTERNS):
-            return None
-
-    cached = _load_cached_root()
-    if cached:
-        return cached
-
+    if not blob:
+        return None
+    parsed = _parse_cwd_from_text(blob)
+    if parsed:
+        return parsed
+    if any(p.search(blob) for p in _CWD_PATTERNS):
+        return None
     return None
 
 
@@ -262,9 +230,9 @@ def is_conversation_start(messages: list[dict]) -> bool:
 
 
 def should_inject_context(messages: list[dict], tools: list[dict] | None) -> bool:
-    if os.environ.get("FREE_CLAUDE_CONTEXT", "0").lower() in ("0", "false", "no"):
+    if _env("CONTEXT", "1").lower() in ("0", "false", "no"):
         return False
-    if os.environ.get("FREE_CLAUDE_CONTEXT_ALWAYS", "").lower() in ("1", "true", "yes"):
+    if _env("CONTEXT_ALWAYS", "").lower() in ("1", "true", "yes"):
         return True
     return is_conversation_start(messages)
 
@@ -296,19 +264,19 @@ def _build_tree(root: Path, files: list[Path]) -> str:
     return "\n".join(f"  {p}" for p in rel_paths)
 
 
-def build_project_context(root: Path) -> str:
+def build_project_context(root: Path, *, mode: str | None = None) -> str:
     """生成项目上下文。默认 tree 模式（仅目录树，用 Read/MCP 读文件）。"""
     root = root.resolve()
     files = _iter_source_files(root)
     if not files:
         return ""
 
-    mode = _context_mode()
+    mode = (mode or _context_mode()).strip().lower()
     tree = _build_tree(root, files)
     header = (
         f"## 当前项目代码库\n"
         f"根目录: {root}\n"
-        f"请用 Read / MCP 工具按需读取文件，不要假设未读到的代码。\n\n"
+        f"回答与编码任务必须结合本项目代码；未列出的文件请用 Read / MCP 工具读取，不要臆测。\n\n"
         f"### 文件列表\n{tree}\n"
     )
 
@@ -322,11 +290,16 @@ def build_project_context(root: Path) -> str:
     if mode == "lite":
         parts.append("### 关键文件\n")
         used += len(parts[-1])
-        key_names = ("README.md", "readme.md", "main.py", "trans_api.py", "app.py")
+        key_names = (
+            "README.md", "readme.md", "main.py", "trans_api.py", "app.py",
+            "go.mod", "pyproject.toml", "package.json", "Cargo.toml",
+        )
+        included: set[str] = set()
         for name in key_names:
             path = root / name
-            if not path.is_file():
+            if not path.is_file() or name in included:
                 continue
+            included.add(name)
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")[:8000]
             except OSError:
@@ -336,6 +309,25 @@ def build_project_context(root: Path) -> str:
                 break
             parts.append(block)
             used += len(block)
+        for path in sorted(root.iterdir()):
+            if used >= max_chars:
+                break
+            if not path.is_file() or path.name in included or path.name.startswith("."):
+                continue
+            if path.suffix.lower() not in TEXT_EXTENSIONS:
+                continue
+            try:
+                if path.stat().st_size > _max_file_bytes():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")[:8000]
+            except OSError:
+                continue
+            block = f"\n--- {path.name} ---\n{text.rstrip()}\n"
+            if used + len(block) > max_chars:
+                break
+            parts.append(block)
+            used += len(block)
+            included.add(path.name)
         return "".join(parts)
 
     parts.append("### 源码内容\n")
@@ -351,7 +343,7 @@ def build_project_context(root: Path) -> str:
         if used + len(block) > max_chars:
             parts.append(
                 f"\n… 其余 {len(files) - included} 个文件已省略"
-                f"（超出 FREE_CLAUDE_CONTEXT_MAX_CHARS）\n"
+                f"（超出 CONTEXT_MAX_CHARS）\n"
             )
             break
         parts.append(block)
@@ -363,17 +355,98 @@ def build_project_context(root: Path) -> str:
     return "".join(parts)
 
 
-def _working_dir_from_blob(blob: str) -> Path | None:
-    for pattern in _CWD_PATTERNS:
-        for match in pattern.finditer(blob):
-            raw = match.group(1).strip(" `'\".,;:")
-            if not raw:
-                continue
-            try:
-                return Path(raw).expanduser().resolve()
-            except OSError:
-                continue
-    return None
+PROVIDER_QA_REL_PATHS = (
+    "README.md",
+    "providers/registry.py",
+    "providers/base.py",
+    "providers/doubao/provider.py",
+    "providers/doubao/browser.py",
+    "providers/deepseek/provider.py",
+    "providers/deepseek/client.py",
+    "providers/deepseek/browser.py",
+    "trans_api.py",
+)
+
+
+def is_proxy_provider_qa(user_text: str) -> bool:
+    """问的是 free-claude 里 doubao / deepseek 实现差异（非 AI 产品科普）。"""
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    providers = ("doubao", "deepseek", "豆包", "深度求索")
+    if not any(p in text for p in providers):
+        return False
+    scope = ("项目", "本项目", "当前", "free-claude", "providers", "代理", "provider", "代码")
+    qa = ("区别", "差异", "对比", "比较", "是什么", "分析", "梳理", "explain", "difference", "compare")
+    return any(s in text for s in scope) or any(q in text for q in qa)
+
+
+def build_proxy_provider_context(*, max_chars: int | None = None) -> str:
+    """注入 free-claude 仓库内 doubao/deepseek 相关源码（问答模式专用）。"""
+    limit = max_chars or min(_max_chars(), 25_000)
+    per_file = 6_000
+    parts = [
+        "## free-claude 代理项目（Doubao / DeepSeek 实现）\n",
+        f"安装目录: {PROXY_DIR}\n",
+        "以下为本仓库源码，请据此对比两个 provider 的实现差异。\n",
+    ]
+    used = sum(len(p) for p in parts)
+    for rel in PROVIDER_QA_REL_PATHS:
+        path = PROXY_DIR / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > per_file:
+            text = text[:per_file] + "\n…(文件已截断)"
+        block = f"\n--- {rel} ---\n{text.rstrip()}\n"
+        if used + len(block) > limit:
+            parts.append("\n… 其余文件已省略（超出字符上限）\n")
+            break
+        parts.append(block)
+        used += len(block)
+    return "".join(parts)
+
+
+def _log_missing_project_root() -> None:
+    print(
+        "[context] 未注入：请求中未识别到工作目录。"
+        "请在项目目录运行 claude（Claude Code 会在 system prompt 传入 working directory）。"
+    )
+
+
+def resolve_request_context(
+    messages: list[dict],
+    system: str | list | None,
+    user_text: str = "",
+    *,
+    for_qa: bool = False,
+) -> str:
+    """问答与 coding 均注入当前项目上下文（CONTEXT=0 可关闭）。"""
+    if not should_inject_context(messages, None):
+        return ""
+
+    root = resolve_project_root(system, messages)
+    if not root:
+        if is_proxy_provider_qa(user_text):
+            ctx = build_proxy_provider_context()
+            if ctx:
+                print(f"[context] 已注入 free-claude provider 源码 ({len(ctx)} chars)")
+            return ctx
+        _log_missing_project_root()
+        return ""
+
+    mode = _context_mode()
+    if for_qa and mode == "tree":
+        mode = "lite"
+
+    ctx = build_project_context(root, mode=mode)
+    if ctx:
+        label = "问答" if for_qa else "coding"
+        print(f"[context] {label} 已注入项目上下文: {root} mode={mode} ({len(ctx)} chars)")
+    return ctx
 
 
 def maybe_project_context(
@@ -381,25 +454,22 @@ def maybe_project_context(
     system: str | list | None,
     tools: list[dict] | None,
 ) -> str:
-    if not should_inject_context(messages, tools):
-        return ""
-    root = resolve_project_root(system, messages)
-    if not root:
-        blob = _collect_prompt_texts(system, messages)
-        cwd = _working_dir_from_blob(blob) if blob else None
-        if cwd and _is_proxy_install_dir(cwd):
-            print(
-                "[context] 当前在 free-claude 目录运行 claude；"
-                "分析业务项目请 cd 到项目目录，"
-                "或在 run.sh 终端: export FREE_CLAUDE_PROJECT_ROOT=/path/to/project"
-            )
-        else:
-            print(
-                "[context] 未识别项目目录；请在项目目录运行 claude，"
-                "或在 run.sh 终端: export FREE_CLAUDE_PROJECT_ROOT=/path/to/project"
-            )
-        return ""
-    ctx = build_project_context(root)
-    if ctx:
-        print(f"[context] 已注入项目上下文: {root} ({len(ctx)} chars)")
-    return ctx
+    user_text = ""
+    if messages:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    user_text = content
+                break
+    return resolve_request_context(messages, system, user_text, for_qa=False)
+
+
+def maybe_qa_context(
+    user_text: str,
+    messages: list[dict],
+    system: str | list | None,
+    *,
+    tools: list[dict] | None,
+) -> str:
+    return resolve_request_context(messages, system, user_text, for_qa=True)

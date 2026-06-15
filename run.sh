@@ -244,12 +244,13 @@ setup_wsl_display_hint() {
 }
 
 setup_context_env() {
-  # 项目上下文：在 run.sh 内默认关闭注入（最快）。启动前 export 可覆盖，例如:
-  #   FREE_CLAUDE_CONTEXT=1 FREE_CLAUDE_CONTEXT_MODE=full ./run.sh
-  export FREE_CLAUDE_CONTEXT="${FREE_CLAUDE_CONTEXT:-0}"
-  export FREE_CLAUDE_CONTEXT_MODE="${FREE_CLAUDE_CONTEXT_MODE:-tree}"
-  export FREE_CLAUDE_CONTEXT_MAX_CHARS="${FREE_CLAUDE_CONTEXT_MAX_CHARS:-20000}"
-  echo "[run.sh] 项目上下文: CONTEXT=${FREE_CLAUDE_CONTEXT} MODE=${FREE_CLAUDE_CONTEXT_MODE} MAX=${FREE_CLAUDE_CONTEXT_MAX_CHARS}"
+  # 服务端只控制「是否注入、注入多少」；项目目录由 Claude Code 请求里的 working directory 自动识别
+  # 关闭注入: CONTEXT=0 ./run.sh
+  # 完整源码: CONTEXT_MODE=full CONTEXT_MAX_CHARS=30000 ./run.sh
+  export CONTEXT="${CONTEXT:-1}"
+  export CONTEXT_MODE="${CONTEXT_MODE:-lite}"
+  export CONTEXT_MAX_CHARS="${CONTEXT_MAX_CHARS:-20000}"
+  echo "[run.sh] 上下文注入: CONTEXT=${CONTEXT} MODE=${CONTEXT_MODE} MAX=${CONTEXT_MAX_CHARS}（项目目录由客户端请求识别）"
 }
 
 main() {

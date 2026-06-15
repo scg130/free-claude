@@ -79,10 +79,8 @@ curl -s -X POST http://127.0.0.1:8000/v1/messages \
 
 3. Agent 写文件（需授权 + 重启 `./run.sh` 加载最新 bridge）：
 
-**项目上下文（自动）：** 在**你的项目目录**下运行 `claude`（`cd your-project && claude`），会从 Claude Code 的 system 里读取 **working directory**，自动注入该目录信息（**不是** free-claude 安装目录）。
-
 ```bash
-cd /path/to/your-project          # 你的项目
+cd /path/to/your-project          # 项目目录由这里决定，Claude Code 会传给代理
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=sk-any
 claude --model deepseek-coder --permission-mode bypassPermissions -p "写一个快速排序到 test.py"
@@ -98,47 +96,53 @@ cd /path/to/free-claude
 # 等到: Uvicorn running on http://127.0.0.1:8000
 ```
 
-### 加速与项目上下文（推荐）
+### 项目上下文
 
-DeepSeek 走网页 API + PoW，**每轮工具调用都要 30s～90s**。`run.sh` 已内置默认配置（**无需在 Claude 窗口设置**）：
+**谁提供项目目录？** Claude Code（客户端）。你在哪个目录运行 `claude`，它就会在每次请求的 system prompt 里带上 **working directory**；服务端收到请求后**自动识别**并扫描该目录。**run.sh 不知道、也不需要知道你在哪个项目。**
+
+**服务端（run.sh）只管注入策略**——开不开、注入多少：
 
 ```bash
-# run.sh 内默认值（最快）
-FREE_CLAUDE_CONTEXT=0
-FREE_CLAUDE_CONTEXT_MODE=tree
+CONTEXT=1              # 是否注入（默认开）
+CONTEXT_MODE=lite      # lite / tree / full
+CONTEXT_MAX_CHARS=20000
 ```
 
-直接 `./run.sh` 即可。需要完整源码时，**在 run.sh 同终端**临时覆盖后启动：
+用法：
 
 ```bash
-FREE_CLAUDE_CONTEXT=1 FREE_CLAUDE_CONTEXT_MODE=full FREE_CLAUDE_CONTEXT_MAX_CHARS=30000 ./run.sh
-```
-
-或先 export 再启动：
-
-```bash
-export FREE_CLAUDE_CONTEXT=1
-export FREE_CLAUDE_CONTEXT_MODE=full
-export FREE_CLAUDE_CONTEXT_MAX_CHARS=30000
+# 终端 1：启动代理（与项目无关，任意目录均可）
 ./run.sh
+
+# 终端 2：在你的项目目录运行 claude
+cd /path/to/your-project
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=sk-any
+claude --model deepseek-coder --permission-mode bypassPermissions
 ```
 
-| 环境变量 | 说明 |
-|----------|------|
-| 设置位置 | **`./run.sh` 终端**（服务端）；`ANTHROPIC_*` 在 Claude Code 终端 |
-| 在 free-claude 目录跑 claude | 正常，默认 `CONTEXT=0` 不注入；若要注入本项目：`FREE_CLAUDE_PROJECT_ROOT=$(pwd) FREE_CLAUDE_CONTEXT=1 ./run.sh` |
-| `FREE_CLAUDE_PROJECT_ROOT` | 可选，手动指定项目根（默认从 Claude Code 工作目录自动识别） |
-| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入（`run.sh` 默认，最快） |
-| `FREE_CLAUDE_CONTEXT=1` | 开启注入 |
-| `FREE_CLAUDE_CONTEXT_MODE` | `tree`（`run.sh` 默认）/ `lite` / `full` |
-| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限；`full` 模式建议 30000 |
-| `FREE_CLAUDE_CONTEXT_ALWAYS=1` | 每轮 API 都重新扫描项目（默认仅会话首轮） |
+需要完整源码时，在 **run.sh 终端**调整注入量后重启：
 
-重启 `./run.sh` 后，终端会打印耗时日志，便于排查慢在哪一步：
+```bash
+CONTEXT_MODE=full CONTEXT_MAX_CHARS=30000 ./run.sh
+```
+
+关闭注入（最快，但不结合项目代码）：
+
+```bash
+CONTEXT=0 ./run.sh
+```
+
+| 配置 | 设置位置 | 说明 |
+|------|----------|------|
+| 项目目录 | **Claude Code 客户端** | `cd your-project && claude`，自动从 system 传入 |
+| `CONTEXT` / `CONTEXT_MODE` / `CONTEXT_MAX_CHARS` | **run.sh 服务端** | 只控制是否注入、注入多少 |
+| `CONTEXT_ALWAYS=1` | run.sh 服务端 | 每轮都重新扫描（默认仅首轮） |
+
+日志示例（项目路径来自请求，不是 run.sh 配置的）：
 
 ```
-[deepseek] prompt=1234 chars | session+pow=2.1s solve=0.3s completion=45.2s total=47.6s
-[context] 已注入项目上下文: /path/to/project (786 chars)
+[context] coding 已注入项目上下文: /path/to/your-project mode=lite (19506 chars)
 ```
 
 `-p` 会执行工具，但必须加 `--permission-mode bypassPermissions`（或 `--dangerously-skip-permissions`），否则 Write 不会落盘。
@@ -201,7 +205,8 @@ mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
 | 只聊天不写文件 | 重启 `./run.sh` 加载 Tool 桥接；见上文 Agent 章节 |
 | 说了要写但文件没出现 | 重启 `./run.sh` 加载最新 bridge；DeepSeek 若输出 `[调用 Write]` 现已自动解析为 `tool_use`；写文件需授权或使用 `claude --dangerously-skip-permissions` |
 | DeepSeek 浏览器被占用（WSL/Linux） | 重新运行 `./run.sh`；系统依赖有问题时：`./run.sh --reinstall-system-deps` |
-| 回复很慢（1 分钟+） | 正常：每轮工具调用都要走 DeepSeek 网页 API + PoW；已默认 `FREE_CLAUDE_CONTEXT_MODE=tree` 减小 prompt；重启 `./run.sh` 后看日志 `[deepseek] prompt=... total=...s` |
+| 回复很慢（1 分钟+） | DeepSeek 每轮走网页 API + PoW；可 `CONTEXT=0` 关闭注入提速；看日志 `[deepseek] prompt=... total=...s` |
+| 交互模式只说不做 / Cogitated 后无回答 | 问答类自动走纯聊天并注入项目上下文；重启 `./run.sh` 后重试 |
 
 ## Claude Code 配置示例
 
