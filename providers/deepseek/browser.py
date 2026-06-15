@@ -7,17 +7,24 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
+from config import APP, BROWSER_VIEWPORT, DEEPSEEK
 from paths import ensure_provider_dir, provider_param_file, provider_profile_dir
+from providers.browser_common import wait_for_credential
+from providers.session_store import SessionStore
 
 PROVIDER_ID = "deepseek"
 PARAM_FILE = provider_param_file(PROVIDER_ID)
 PROFILE_DIR = provider_profile_dir(PROVIDER_ID)
-CHAT_URL = "https://chat.deepseek.com/"
-DEBUG_PORT = 9333
+CHAT_URL = DEEPSEEK.chat_url
+DEBUG_PORT = DEEPSEEK.debug_port
+_SESSION = SessionStore(PARAM_FILE)
+_SESSION_TTL_SEC = DEEPSEEK.session_ttl_sec
+_pow_executor = ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 2), thread_name_prefix="pow")
 _PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 _browser_lock = asyncio.Lock()
@@ -30,7 +37,6 @@ _captured_auth: str = ""
 _captured_hif_leim: str = ""
 _cached_session_id: str = ""
 _cached_session_at: float = 0.0
-_SESSION_TTL_SEC = 300
 
 _PROFILE_IN_USE_MSG = (
     "DeepSeek 浏览器配置目录已被占用（.profiles/deepseek）。"
@@ -112,15 +118,11 @@ def _save_session(ds_session_id: str, authorization: str) -> dict:
     if not auth:
         raise RuntimeError("无法保存 DeepSeek 凭证：Bearer token 无效")
     ensure_provider_dir(PROVIDER_ID)
-    data = {"ds_session_id": ds_session_id, "authorization": auth}
-    PARAM_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return data
+    return _SESSION.save({"ds_session_id": ds_session_id, "authorization": auth})
 
 
 def load_session() -> dict:
-    if not PARAM_FILE.exists():
-        return {}
-    return json.loads(PARAM_FILE.read_text(encoding="utf-8"))
+    return _SESSION.load()
 
 
 def _is_valid_bearer(token: str) -> bool:
@@ -145,6 +147,10 @@ def valid_authorization(auth: str) -> bool:
 def session_ready() -> bool:
     s = load_session()
     return bool(s.get("ds_session_id") and _is_valid_bearer(s.get("authorization", "")))
+
+
+def clear_session() -> None:
+    _SESSION.clear()
 
 
 def _normalize_auth(token: str) -> str:
@@ -237,19 +243,14 @@ async def _read_sessionid(context: BrowserContext) -> tuple[str, str]:
 
 
 async def _wait_login(context: BrowserContext, page: Page) -> tuple[str, str]:
-    try:
+    async def _read() -> tuple[str, str]:
         return await _read_sessionid(context)
-    except RuntimeError:
-        pass
-    print("[deepseek] 请在浏览器窗口中登录 chat.deepseek.com…")
-    for _ in range(300):
-        try:
-            sid, auth = await _read_sessionid(context)
-            print("[deepseek] 登录成功")
-            return sid, auth
-        except RuntimeError:
-            await asyncio.sleep(1)
-    raise TimeoutError("登录超时：请在浏览器中完成 DeepSeek 登录")
+
+    return await wait_for_credential(
+        _read,
+        provider_label="deepseek",
+        wait_sec=DEEPSEEK.login_wait_sec,
+    )
 
 
 async def _close_browser(*, force: bool = False) -> None:
@@ -351,7 +352,7 @@ async def _launch_persistent(*, headless: bool) -> Page:
             _context = await _playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=headless,
-                viewport={"width": 1280, "height": 800},
+                viewport=BROWSER_VIEWPORT,
                 locale="zh-CN",
                 args=launch_args,
             )
@@ -392,8 +393,8 @@ async def _ensure_page(*, headless: bool) -> Page:
 
 
 async def _refresh_locked(headless: bool | None) -> dict:
-    if PARAM_FILE.exists() and not session_ready():
-        PARAM_FILE.unlink()
+    if not session_ready() and PARAM_FILE.exists():
+        _SESSION.clear()
         print("[deepseek] 检测到无效凭证，将重新登录…")
 
     if headless is not False and PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir()):
@@ -412,6 +413,20 @@ async def _refresh_locked(headless: bool | None) -> dict:
     return result
 
 
+async def validate_session() -> bool:
+    """无头校验 token / cookie 是否仍有效。"""
+    if not PROFILE_DIR.exists() or not any(PROFILE_DIR.iterdir()):
+        return False
+    async with _browser_lock:
+        try:
+            page = await _ensure_page(headless=True)
+            await _read_sessionid(page.context)
+            return True
+        except Exception:
+            await _close_browser(force=not _via_cdp)
+            return False
+
+
 async def refresh_credentials(headless: bool | None = None) -> dict:
     async with _browser_lock:
         return await _refresh_locked(headless)
@@ -419,7 +434,8 @@ async def refresh_credentials(headless: bool | None = None) -> dict:
 
 JS_FETCH = """
 async (args) => {
-  const base = 'https://chat.deepseek.com/api/v0';
+  const base = args.api_base || 'https://chat.deepseek.com/api/v0';
+  const timeout = args.timeout_ms || 180000;
   function apiHeaders(extra) {
     const h = {
       'content-type': 'application/json',
@@ -442,7 +458,7 @@ async (args) => {
         headers: apiHeaders(),
         body: '{}',
         credentials: 'include',
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeout),
       });
       const createData = await createRes.json();
       if (!createRes.ok || createData.code !== 0) {
@@ -457,7 +473,7 @@ async (args) => {
         }),
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
         credentials: 'include',
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeout),
       });
       const powData = await powRes.json();
       if (!powRes.ok || powData.code !== 0) {
@@ -471,7 +487,7 @@ async (args) => {
         headers: apiHeaders(),
         body: '{}',
         credentials: 'include',
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeout),
       });
       const data = await res.json();
       if (!res.ok || data.code !== 0) {
@@ -489,7 +505,7 @@ async (args) => {
         }),
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
         credentials: 'include',
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeout),
       });
       const data = await res.json();
       if (!res.ok || data.code !== 0) {
@@ -507,7 +523,7 @@ async (args) => {
         }),
         body: args.body,
         credentials: 'include',
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(timeout),
       });
       if (res.status === 401 || res.status === 403) {
         return { auth_error: true, status: res.status, detail: await res.text() };
@@ -547,7 +563,7 @@ async def _invalidate_session_cache() -> None:
 
 async def _session_and_pow(page: Page, fetch_args: dict) -> dict:
     global _cached_session_id, _cached_session_at
-    reuse = os.environ.get("DEEPSEEK_REUSE_SESSION", "1").lower() not in ("0", "false", "no")
+    reuse = DEEPSEEK.reuse_session
     now = time.time()
     if reuse and _cached_session_id and now - _cached_session_at < _SESSION_TTL_SEC:
         pow_res = await page.evaluate(
@@ -572,7 +588,7 @@ async def chat_via_browser(
     model_type: str = "default",
     thinking_enabled: bool = False,
 ) -> dict:
-    """在浏览器上下文中调用 DeepSeek API（自动携带 authorization / x-hif-leim / cookies）。"""
+    """在浏览器上下文中调用 DeepSeek API（PoW 在锁外并行求解）。"""
     from providers.deepseek.pow import PowChallenge, get_solver
 
     t0 = time.perf_counter()
@@ -584,26 +600,17 @@ async def chat_via_browser(
             await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(1500)
 
-        fetch_args = await _fetch_args(page)
-
+        fetch_args = {
+            **await _fetch_args(page),
+            "api_base": DEEPSEEK.api_base,
+            "timeout_ms": APP.fetch_timeout_ms,
+        }
         sp = await _session_and_pow(page, fetch_args)
         if sp.get("error"):
             return sp
         session_id = sp["session_id"]
         raw = sp["challenge"]
         t1 = time.perf_counter()
-
-        challenge = PowChallenge(
-            algorithm=raw["algorithm"],
-            challenge=raw["challenge"],
-            salt=raw["salt"],
-            signature=raw["signature"],
-            difficulty=int(raw["difficulty"]),
-            expire_at=int(raw["expire_at"]),
-            target_path=raw["target_path"],
-        )
-        pow_header = get_solver().build_header(challenge)
-        t2 = time.perf_counter()
 
         body = json.dumps(
             {
@@ -620,6 +627,24 @@ async def chat_via_browser(
             ensure_ascii=False,
         )
 
+    challenge = PowChallenge(
+        algorithm=raw["algorithm"],
+        challenge=raw["challenge"],
+        salt=raw["salt"],
+        signature=raw["signature"],
+        difficulty=int(raw["difficulty"]),
+        expire_at=int(raw["expire_at"]),
+        target_path=raw["target_path"],
+    )
+    loop = asyncio.get_running_loop()
+    pow_header = await loop.run_in_executor(
+        _pow_executor, get_solver().build_header, challenge
+    )
+    t2 = time.perf_counter()
+
+    async with _browser_lock:
+        page = await _ensure_page(headless=True)
+        fetch_args = await _fetch_args(page)
         result = await page.evaluate(
             JS_FETCH,
             {
@@ -628,6 +653,8 @@ async def chat_via_browser(
                 "session_id": session_id,
                 "pow": pow_header,
                 "body": body,
+                "api_base": DEEPSEEK.api_base,
+                "timeout_ms": APP.fetch_timeout_ms,
             },
         )
         t3 = time.perf_counter()

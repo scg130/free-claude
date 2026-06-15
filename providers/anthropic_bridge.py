@@ -667,6 +667,9 @@ def parse_agent_response(raw: str, *, user_hint: str = "") -> AgentResult:
             text = re.sub(r"```(?:python)?\s*\n.*?```", "", text or raw, flags=re.DOTALL | re.IGNORECASE).strip()
     if len(tool_uses) > 1:
         tool_uses = tool_uses[:1]
+    if not tool_uses and raw.strip():
+        preview = raw.strip().replace("\n", " ")[:120]
+        print(f"[bridge] 未解析到 tool_use，将作为纯文本返回: {preview}…")
     return AgentResult(text=text, tool_uses=tool_uses)
 
 

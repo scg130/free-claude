@@ -7,14 +7,20 @@ import uuid
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from config import APP, DOUBAO
 from paths import ensure_provider_dir, provider_param_file, provider_profile_dir
+from providers.browser_common import launch_persistent_page, wait_for_credential
+from providers.rate_limit import get_limiter
+from providers.retry import is_transient_error, with_retry
+from providers.session_store import SessionStore
 
 PROVIDER_ID = "doubao"
 PARAM_FILE = provider_param_file(PROVIDER_ID)
 PROFILE_DIR = provider_profile_dir(PROVIDER_ID)
-CHAT_URL = "https://www.doubao.com/chat/"
-COMPLETION_URL = "https://www.doubao.com/chat/completion"
-DEFAULT_BOT_ID = "7338286299411103781"
+CHAT_URL = DOUBAO.chat_url
+COMPLETION_URL = DOUBAO.completion_url
+DEFAULT_BOT_ID = DOUBAO.default_bot_id
+_SESSION = SessionStore(PARAM_FILE)
 
 JS_STREAM = """
 async (args) => {
@@ -29,7 +35,7 @@ async (args) => {
     headers,
     body: args.body,
     credentials: 'include',
-    signal: AbortSignal.timeout(180000),
+    signal: AbortSignal.timeout(args.timeout_ms || 180000),
   };
   try {
     const res = await fetch(args.url, opts);
@@ -60,19 +66,19 @@ _page: Page | None = None
 
 def _save_session(sessionid: str, sessionid_ss: str) -> dict:
     ensure_provider_dir(PROVIDER_ID)
-    data = {"sessionid": sessionid, "sessionid_ss": sessionid_ss}
-    PARAM_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return data
+    return _SESSION.save({"sessionid": sessionid, "sessionid_ss": sessionid_ss})
 
 
 def load_session() -> dict:
-    if not PARAM_FILE.exists():
-        return {}
-    return json.loads(PARAM_FILE.read_text(encoding="utf-8"))
+    return _SESSION.load()
 
 
 def session_ready() -> bool:
     return bool(load_session().get("sessionid"))
+
+
+def clear_session() -> None:
+    _SESSION.clear()
 
 
 async def _read_sessionid(context: BrowserContext) -> tuple[str, str]:
@@ -89,19 +95,11 @@ async def _read_sessionid(context: BrowserContext) -> tuple[str, str]:
 
 
 async def _wait_login(context: BrowserContext) -> tuple[str, str]:
-    try:
-        return await _read_sessionid(context)
-    except RuntimeError:
-        pass
-    print("[doubao] 请在浏览器窗口中登录豆包…")
-    for _ in range(180):
-        try:
-            sid, ss = await _read_sessionid(context)
-            print("[doubao] 登录成功")
-            return sid, ss
-        except RuntimeError:
-            await asyncio.sleep(1)
-    raise TimeoutError("登录超时：请在浏览器中完成豆包登录")
+    return await wait_for_credential(
+        lambda: _read_sessionid(context),
+        provider_label="doubao",
+        wait_sec=DOUBAO.login_wait_sec,
+    )
 
 
 async def _close_browser() -> None:
@@ -120,19 +118,28 @@ async def _ensure_page(*, headless: bool) -> Page:
     if _page and not _page.is_closed():
         return _page
 
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     _playwright = await async_playwright().start()
-    _context = await _playwright.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
+    _context, _page = await launch_persistent_page(
+        _playwright,
+        PROFILE_DIR,
         headless=headless,
-        viewport={"width": 1280, "height": 800},
-        locale="zh-CN",
-        args=["--disable-blink-features=AutomationControlled"],
+        chat_url=CHAT_URL,
     )
-    _page = _context.pages[0] if _context.pages else await _context.new_page()
-    await _page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-    await _page.wait_for_timeout(2000)
     return _page
+
+
+async def validate_session() -> bool:
+    """无头校验 cookie 是否仍有效（不弹浏览器）。"""
+    if not PROFILE_DIR.exists() or not any(PROFILE_DIR.iterdir()):
+        return False
+    async with _browser_lock:
+        try:
+            page = await _ensure_page(headless=True)
+            await _read_sessionid(page.context)
+            return True
+        except Exception:
+            await _close_browser()
+            return False
 
 
 def _build_payload(prompt: str, conv_id: str) -> dict:
@@ -287,7 +294,12 @@ async def _chat_locked(prompt: str, conv_id: str, *, retried: bool = False) -> s
     body = json.dumps(_build_payload(prompt, conv_id), ensure_ascii=False)
     res = await page.evaluate(
         JS_STREAM,
-        {"url": COMPLETION_URL, "body": body, "trace_id": uuid.uuid4().hex},
+        {
+            "url": COMPLETION_URL,
+            "body": body,
+            "trace_id": uuid.uuid4().hex,
+            "timeout_ms": APP.fetch_timeout_ms,
+        },
     )
     status = res.get("status", 0)
     raw = res.get("body", "")
@@ -308,8 +320,19 @@ async def _chat_locked(prompt: str, conv_id: str, *, retried: bool = False) -> s
 
 
 async def chat_completion(prompt: str, conv_id: str) -> str:
-    async with _browser_lock:
-        return await _chat_locked(prompt, conv_id)
+    await get_limiter(PROVIDER_ID, APP.rate_limit_rpm).acquire()
+
+    async def _call() -> str:
+        async with _browser_lock:
+            return await _chat_locked(prompt, conv_id)
+
+    return await with_retry(
+        _call,
+        max_attempts=APP.retry_max,
+        base_delay=APP.retry_base_delay,
+        retry_if=is_transient_error,
+        label="doubao",
+    )
 
 
 async def shutdown() -> None:

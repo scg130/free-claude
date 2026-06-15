@@ -1,11 +1,9 @@
 """豆包凭证刷新 CLI（兼容入口）。"""
 
-import asyncio
+import sys
 
-from providers import get_provider
-from providers.doubao.browser import PARAM_FILE
+from auth import main
 
 if __name__ == "__main__":
-    provider = get_provider("doubao")
-    asyncio.run(provider.startup(refresh_credentials=True))
-    print(f"[doubao_auth] 已保存 {PARAM_FILE}")
+    sys.argv = [sys.argv[0], "doubao", *sys.argv[1:]]
+    main()

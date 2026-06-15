@@ -6,7 +6,7 @@ import struct
 import urllib.request
 from dataclasses import dataclass
 
-WASM_URL = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+from config import DEEPSEEK
 
 _solver: "PowSolver | None" = None
 
@@ -30,7 +30,7 @@ class PowSolver:
 
     def _load_bytes(self) -> bytes:
         if self._wasm_bytes is None:
-            with urllib.request.urlopen(WASM_URL, timeout=30) as resp:
+            with urllib.request.urlopen(DEEPSEEK.wasm_url, timeout=30) as resp:
                 self._wasm_bytes = resp.read()
         return self._wasm_bytes
 

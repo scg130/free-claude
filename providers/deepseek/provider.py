@@ -12,13 +12,18 @@ class DeepSeekProvider(ChatProvider):
     )
 
     async def startup(self, *, refresh_credentials: bool = True) -> None:
-        if refresh_credentials and browser.PARAM_FILE.exists():
-            browser.PARAM_FILE.unlink()
-        if refresh_credentials or not browser.session_ready():
+        if refresh_credentials:
+            browser.clear_session()
+            await browser.refresh_credentials()
+        elif not browser.session_ready():
+            await browser.refresh_credentials()
+        elif not await browser.validate_session():
+            print("[deepseek] 凭证失效，自动刷新…")
             await browser.refresh_credentials()
         await browser.ensure_runtime_page()
         try:
             from providers.deepseek.pow import get_solver
+
             get_solver().warmup()
             print("[deepseek] PoW WASM 已预热")
         except Exception as e:
@@ -47,3 +52,8 @@ class DeepSeekProvider(ChatProvider):
             model=model,
             project_context=project_context,
         )
+
+    async def check_health(self) -> dict:
+        ready = browser.session_ready()
+        valid = await browser.validate_session() if ready else False
+        return {"session_ready": ready, "session_valid": valid}

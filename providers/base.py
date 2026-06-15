@@ -50,6 +50,10 @@ class ChatProvider(ABC):
     async def chat(self, prompt: str, conv_id: str) -> ChatResult:
         """发送用户消息并返回完整回复。"""
 
+    async def check_health(self) -> dict:
+        """凭证与服务健康状态（子类可覆盖）。"""
+        return {"session_ready": False, "session_valid": False}
+
     async def chat_agent(
         self,
         messages: list[dict],

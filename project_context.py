@@ -8,6 +8,7 @@ import os
 import re
 from pathlib import Path
 
+from config import CONTEXT as CONTEXT_CFG
 from paths import ROOT_DIR
 
 PROXY_DIR = ROOT_DIR.resolve()
@@ -66,30 +67,20 @@ _ABS_PATH = re.compile(
 )
 
 
-def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default)
-
-
 def _max_chars() -> int:
-    try:
-        return max(4_000, int(_env("CONTEXT_MAX_CHARS", "20000")))
-    except ValueError:
-        return 20_000
+    return CONTEXT_CFG.max_chars
 
 
 def _context_mode() -> str:
-    return _env("CONTEXT_MODE", "tree").strip().lower()
+    return CONTEXT_CFG.mode
 
 
 def _max_file_bytes() -> int:
-    try:
-        return max(1_024, int(_env("CONTEXT_MAX_FILE_BYTES", "51200")))
-    except ValueError:
-        return 51_200
+    return CONTEXT_CFG.max_file_bytes
 
 
 def _ignore_dirs() -> frozenset[str]:
-    extra = _env("CONTEXT_IGNORE", "")
+    extra = CONTEXT_CFG.ignore
     names = {x.strip() for x in extra.split(",") if x.strip()}
     return DEFAULT_IGNORE_DIRS | names
 
@@ -230,9 +221,9 @@ def is_conversation_start(messages: list[dict]) -> bool:
 
 
 def should_inject_context(messages: list[dict], tools: list[dict] | None) -> bool:
-    if _env("CONTEXT", "1").lower() in ("0", "false", "no"):
+    if not CONTEXT_CFG.enabled:
         return False
-    if _env("CONTEXT_ALWAYS", "").lower() in ("1", "true", "yes"):
+    if CONTEXT_CFG.always:
         return True
     return is_conversation_start(messages)
 
@@ -424,7 +415,7 @@ def resolve_request_context(
     *,
     for_qa: bool = False,
 ) -> str:
-    """问答与 coding 均注入当前项目上下文（CONTEXT=0 可关闭）。"""
+    """问答与 coding 均注入当前项目上下文（.env 中 CONTEXT=0 可关闭）。"""
     if not should_inject_context(messages, None):
         return ""
 

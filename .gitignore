@@ -1,6 +1,7 @@
 venv
 .cache/
 .codegraph
+.env
 params/*/session.json
 params/*/ws_params.json
 .profiles/

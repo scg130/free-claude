@@ -2,6 +2,7 @@
 
 import json
 
+from config import APP
 from providers.anthropic_bridge import (
     build_agent_prompt,
     parse_agent_response,
@@ -9,6 +10,8 @@ from providers.anthropic_bridge import (
 )
 from providers.base import ChatResult
 from providers.deepseek import browser
+from providers.rate_limit import get_limiter
+from providers.retry import is_transient_error, with_retry
 
 WEB_BASE = "https://chat.deepseek.com"
 API_PREFIX = "/api/v0"
@@ -113,26 +116,36 @@ async def _web_completion(
     retried: bool = False,
 ) -> str:
     model_type, thinking = _model_flags(model)
-    raw = await browser.chat_via_browser(
-        prompt,
-        model_type=model_type,
-        thinking_enabled=thinking,
+    await get_limiter("deepseek", APP.rate_limit_rpm).acquire()
+
+    async def _call() -> str:
+        raw = await browser.chat_via_browser(
+            prompt,
+            model_type=model_type,
+            thinking_enabled=thinking,
+        )
+        if raw.get("auth_error") and not retried:
+            print("[deepseek] 会话过期，重新登录…")
+            await browser.refresh_credentials()
+            await browser.ensure_runtime_page()
+            return await _web_completion(prompt, model=model, retried=True)
+
+        if raw.get("error"):
+            raise RuntimeError(f"DeepSeek {raw['error']}: {raw.get('detail', '')[:800]}")
+
+        body = raw.get("body", "")
+        text = _parse_sse(body, include_thinking=thinking)
+        if not text:
+            raise RuntimeError(f"DeepSeek 未返回文本，响应片段: {body[:500]}")
+        return text
+
+    return await with_retry(
+        _call,
+        max_attempts=APP.retry_max,
+        base_delay=APP.retry_base_delay,
+        retry_if=is_transient_error,
+        label="deepseek",
     )
-
-    if raw.get("auth_error") and not retried:
-        print("[deepseek] 会话过期，重新登录…")
-        await browser.refresh_credentials()
-        await browser.ensure_runtime_page()
-        return await _web_completion(prompt, model=model, retried=True)
-
-    if raw.get("error"):
-        raise RuntimeError(f"DeepSeek {raw['error']}: {raw.get('detail', '')[:800]}")
-
-    body = raw.get("body", "")
-    text = _parse_sse(body, include_thinking=thinking)
-    if not text:
-        raise RuntimeError(f"DeepSeek 未返回文本，响应片段: {body[:500]}")
-    return text
 
 
 async def chat_completion(prompt: str, model: str | None = None) -> ChatResult:

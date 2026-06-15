@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -9,25 +10,30 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from project_context import is_conversation_start, resolve_request_context
 
-from providers import get_provider, list_models, shutdown_all, startup_all
+from providers import get_provider, list_models, providers_health, shutdown_all, startup_all
 from providers.anthropic_bridge import build_qa_user_prompt, is_qa_request
-from providers.doubao.browser import session_ready as doubao_session_ready
-from providers.deepseek.browser import session_ready as deepseek_session_ready
+from providers.credential_guard import check_all_credentials, credential_guard_loop
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[startup] 初始化 AI 提供商…")
-    await startup_all(
-        refresh_credentials=not (doubao_session_ready() or deepseek_session_ready())
-    )
+    await startup_all(refresh_credentials=True)
     print(f"[startup] 已注册模型: {', '.join(list_models())}")
-    yield
-    print("[shutdown] 关闭提供商资源…")
+    guard_task = asyncio.create_task(credential_guard_loop())
     try:
-        await shutdown_all()
-    except Exception as e:
-        print(f"[shutdown] 关闭异常（可忽略）: {e}")
+        yield
+    finally:
+        guard_task.cancel()
+        try:
+            await guard_task
+        except asyncio.CancelledError:
+            pass
+        print("[shutdown] 关闭提供商资源…")
+        try:
+            await shutdown_all()
+        except Exception as e:
+            print(f"[shutdown] 关闭异常（可忽略）: {e}")
 
 
 app = FastAPI(title="AI -> Claude Code 中转 API", lifespan=lifespan)
@@ -126,6 +132,24 @@ class MessagesRequest(BaseModel):
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     return JSONResponse({"status": "ok", "service": "free-claude"})
+
+
+@app.get("/health")
+async def health_detail():
+    providers = await providers_health()
+    all_valid = all(p.get("session_valid") for p in providers.values())
+    return {
+        "status": "ok" if all_valid else "degraded",
+        "service": "free-claude",
+        "providers": providers,
+    }
+
+
+@app.post("/health/refresh")
+async def health_refresh_credentials():
+    """手动触发凭证检查与自动续期。"""
+    result = await check_all_credentials()
+    return {"status": "ok", "providers": result}
 
 
 @app.get("/v1/models")
@@ -290,4 +314,6 @@ if __name__ == "__main__":
     _check_deps()
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    from config import SERVER
+
+    uvicorn.run(app, host=SERVER.host, port=SERVER.port)

@@ -30,7 +30,17 @@ def list_models() -> list[str]:
 async def startup_all(*, refresh_credentials: bool = True) -> None:
     for provider in _providers.values():
         try:
-            await provider.startup(refresh_credentials=refresh_credentials)
+            need_refresh = refresh_credentials
+            if refresh_credentials:
+                if provider.id == "doubao":
+                    from providers.doubao import browser as b
+
+                    need_refresh = not b.session_ready()
+                elif provider.id == "deepseek":
+                    from providers.deepseek import browser as b
+
+                    need_refresh = not b.session_ready()
+            await provider.startup(refresh_credentials=need_refresh)
         except Exception as e:
             print(f"[startup] {provider.id} 跳过: {e}")
 
@@ -38,6 +48,24 @@ async def startup_all(*, refresh_credentials: bool = True) -> None:
 async def shutdown_all() -> None:
     for provider in _providers.values():
         await provider.shutdown()
+
+
+async def providers_health() -> dict:
+    result: dict = {}
+    for provider in _providers.values():
+        try:
+            result[provider.id] = {
+                "display_name": provider.display_name,
+                **await provider.check_health(),
+            }
+        except Exception as exc:
+            result[provider.id] = {
+                "display_name": provider.display_name,
+                "session_ready": False,
+                "session_valid": False,
+                "error": str(exc),
+            }
+    return result
 
 
 def _load_providers() -> None:

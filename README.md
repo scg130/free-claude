@@ -29,6 +29,7 @@ params/
 ## 快速开始
 
 ```bash
+cp .env.example .env   # 可选，按需修改配置
 chmod +x run.sh && ./run.sh
 ```
 
@@ -96,17 +97,32 @@ cd /path/to/free-claude
 # 等到: Uvicorn running on http://127.0.0.1:8000
 ```
 
+### 配置（.env）
+
+所有服务端配置集中在项目根目录 **`.env`** 文件（从 `.env.example` 复制）：
+
+```bash
+cp .env.example .env
+```
+
+`run.sh` 与 `trans_api.py` 启动时自动加载。主要项：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `API_HOST` / `API_PORT` | `127.0.0.1:8000` | 代理监听地址 |
+| `CONTEXT` | `1` | 是否注入项目上下文 |
+| `CONTEXT_MODE` | `lite` | `lite` / `tree` / `full` |
+| `CREDENTIAL_CHECK_INTERVAL` | `3600` | 凭证后台检查间隔（秒） |
+| `RETRY_MAX` | `3` | 请求失败重试次数 |
+| `RATE_LIMIT_RPM` | `30` | 每 provider 每分钟请求上限 |
+
+完整列表见 [`.env.example`](.env.example)，每项均有中文注释。
+
 ### 项目上下文
 
 **谁提供项目目录？** Claude Code（客户端）。你在哪个目录运行 `claude`，它就会在每次请求的 system prompt 里带上 **working directory**；服务端收到请求后**自动识别**并扫描该目录。**run.sh 不知道、也不需要知道你在哪个项目。**
 
-**服务端（run.sh）只管注入策略**——开不开、注入多少：
-
-```bash
-CONTEXT=1              # 是否注入（默认开）
-CONTEXT_MODE=lite      # lite / tree / full
-CONTEXT_MAX_CHARS=20000
-```
+**服务端只管注入策略**（在 `.env` 中配置）——开不开、注入多少：
 
 用法：
 
@@ -121,23 +137,22 @@ export ANTHROPIC_API_KEY=sk-any
 claude --model deepseek-coder --permission-mode bypassPermissions
 ```
 
-需要完整源码时，在 **run.sh 终端**调整注入量后重启：
+需要完整源码时，编辑 `.env` 后重启：
 
 ```bash
-CONTEXT_MODE=full CONTEXT_MAX_CHARS=30000 ./run.sh
+# .env 中设置
+CONTEXT_MODE=full
+CONTEXT_MAX_CHARS=30000
+./run.sh
 ```
 
-关闭注入（最快，但不结合项目代码）：
-
-```bash
-CONTEXT=0 ./run.sh
-```
+关闭注入（最快，但不结合项目代码）：`.env` 中设 `CONTEXT=0`
 
 | 配置 | 设置位置 | 说明 |
 |------|----------|------|
 | 项目目录 | **Claude Code 客户端** | `cd your-project && claude`，自动从 system 传入 |
-| `CONTEXT` / `CONTEXT_MODE` / `CONTEXT_MAX_CHARS` | **run.sh 服务端** | 只控制是否注入、注入多少 |
-| `CONTEXT_ALWAYS=1` | run.sh 服务端 | 每轮都重新扫描（默认仅首轮） |
+| `CONTEXT` / `CONTEXT_MODE` / `CONTEXT_MAX_CHARS` | **`.env` 服务端** | 只控制是否注入、注入多少 |
+| `CONTEXT_ALWAYS` | `.env` 服务端 | 每轮都重新扫描（默认仅首轮） |
 
 日志示例（项目路径来自请求，不是 run.sh 配置的）：
 
@@ -194,13 +209,31 @@ mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
 - 豆包 WS 参数 → `params/doubao/ws_params.json`
 - DeepSeek 会话 → `params/deepseek/session.json`（抓包 `/api/v0/` 请求时自动保存）
 
+## 凭证与可靠性
+
+| 能力 | 说明 |
+|------|------|
+| 凭证备份 | `session.json.bak`，主文件损坏时自动恢复 |
+| 自动续期 | 后台每 `CREDENTIAL_CHECK_INTERVAL` 秒（默认 3600）无头校验，失效则自动刷新 |
+| 统一刷新 | `python auth.py [doubao\|deepseek\|all]` |
+| 健康检查 | `GET /health` 查看各 provider 凭证状态 |
+| 手动续期 | `POST /health/refresh` |
+| 请求重试 | 网络波动自动重试 `RETRY_MAX` 次（默认 3） |
+| 速率限制 | 默认 `RATE_LIMIT_RPM=30` 防封禁 |
+| PoW 并行 | DeepSeek PoW 在锁外线程池求解，减少阻塞 |
+
+```bash
+curl http://127.0.0.1:8000/health
+python auth.py all          # 刷新全部凭证
+```
+
 ## 常见问题
 
 | 现象 | 处理 |
 |------|------|
 | 弹出浏览器要求登录 | 首次正常，登录后自动继续 |
 | `未知模型` | 查看 `GET /v1/models` 支持的 model 列表 |
-| API 返回 502 | 运行 `python doubao_auth.py` 或 `python deepseek_auth.py` 重新登录 |
+| API 返回 502 | `python auth.py all` 或 `curl -X POST http://127.0.0.1:8000/health/refresh` |
 | `Not logged in · Please run /login` | 设置 `ANTHROPIC_API_KEY=sk-any` |
 | 只聊天不写文件 | 重启 `./run.sh` 加载 Tool 桥接；见上文 Agent 章节 |
 | 说了要写但文件没出现 | 重启 `./run.sh` 加载最新 bridge；DeepSeek 若输出 `[调用 Write]` 现已自动解析为 `tool_use`；写文件需授权或使用 `claude --dangerously-skip-permissions` |

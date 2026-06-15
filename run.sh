@@ -10,9 +10,29 @@ REINSTALL_SYSTEM_DEPS=0
 PY="$ROOT/venv/bin/python"
 PIP="$ROOT/venv/bin/pip"
 PW="$ROOT/venv/bin/playwright"
-DEEPSEEK_DEBUG_PORT=9333
 
 mkdir -p "$CACHE_DIR"
+
+load_env_file() {
+  local f="$ROOT/.env"
+  if [[ -f "$f" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$f"
+    set +a
+    echo "[run.sh] 已加载 .env"
+  else
+    echo "[run.sh] 未找到 .env，使用 .env.example 默认值（可执行: cp .env.example .env）"
+  fi
+  API_PORT="${API_PORT:-8000}"
+  DEEPSEEK_DEBUG_PORT="${DEEPSEEK_DEBUG_PORT:-9333}"
+}
+
+print_config_summary() {
+  echo "[run.sh] API=${API_HOST:-127.0.0.1}:${API_PORT}"
+  echo "[run.sh] 上下文 CONTEXT=${CONTEXT:-1} MODE=${CONTEXT_MODE:-lite}"
+  echo "[run.sh] 可靠性 CHECK=${CREDENTIAL_CHECK_INTERVAL:-3600}s RETRY=${RETRY_MAX:-3} RATE=${RATE_LIMIT_RPM:-30}/min"
+}
 
 is_wsl() {
   [[ -n "${WSL_DISTRO_NAME:-}" ]] && return 0
@@ -227,9 +247,9 @@ cleanup_stale_browsers() {
 
 stop_old_api() {
   local pids
-  pids=$(lsof -ti :8000 2>/dev/null || true)
+  pids=$(lsof -ti :"${API_PORT}" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
-    echo "[run.sh] 停止占用 8000 端口的旧进程: $pids"
+    echo "[run.sh] 停止占用 ${API_PORT} 端口的旧进程: $pids"
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
     sleep 1
@@ -243,19 +263,10 @@ setup_wsl_display_hint() {
   fi
 }
 
-setup_context_env() {
-  # 服务端只控制「是否注入、注入多少」；项目目录由 Claude Code 请求里的 working directory 自动识别
-  # 关闭注入: CONTEXT=0 ./run.sh
-  # 完整源码: CONTEXT_MODE=full CONTEXT_MAX_CHARS=30000 ./run.sh
-  export CONTEXT="${CONTEXT:-1}"
-  export CONTEXT_MODE="${CONTEXT_MODE:-lite}"
-  export CONTEXT_MAX_CHARS="${CONTEXT_MAX_CHARS:-20000}"
-  echo "[run.sh] 上下文注入: CONTEXT=${CONTEXT} MODE=${CONTEXT_MODE} MAX=${CONTEXT_MAX_CHARS}（项目目录由客户端请求识别）"
-}
-
 main() {
   parse_args "$@"
-  setup_context_env
+  load_env_file
+  print_config_summary
   ensure_venv
   ensure_python_deps
   ensure_playwright_browser
@@ -264,7 +275,7 @@ main() {
   stop_old_api
   setup_wsl_display_hint
 
-  echo "[run.sh] 启动 trans_api (http://127.0.0.1:8000)…"
+  echo "[run.sh] 启动 trans_api (http://${API_HOST:-127.0.0.1}:${API_PORT})…"
   exec "$PY" "$ROOT/trans_api.py"
 }
 
