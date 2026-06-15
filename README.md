@@ -100,36 +100,37 @@ cd /path/to/free-claude
 
 ### 加速与项目上下文（推荐）
 
-DeepSeek 走网页 API + PoW，**每轮工具调用都要 30s～90s**。可通过环境变量控制注入到 prompt 的项目信息量：
-
-**最快（推荐，已有 codegraph / Read 工具）：**
+DeepSeek 走网页 API + PoW，**每轮工具调用都要 30s～90s**。`run.sh` 已内置默认配置（**无需在 Claude 窗口设置**）：
 
 ```bash
-export FREE_CLAUDE_CONTEXT_MODE=tree    # 默认已是 tree，仅注入目录树
-export FREE_CLAUDE_CONTEXT=0            # 完全关闭项目注入，最快
+# run.sh 内默认值（最快）
+FREE_CLAUDE_CONTEXT=0
+FREE_CLAUDE_CONTEXT_MODE=tree
 ```
 
-**默认（平衡）：**
+直接 `./run.sh` 即可。需要完整源码时，**在 run.sh 同终端**临时覆盖后启动：
 
 ```bash
-export FREE_CLAUDE_CONTEXT_MODE=tree    # 仅文件列表，代码用 Read/MCP 按需读取
+FREE_CLAUDE_CONTEXT=1 FREE_CLAUDE_CONTEXT_MODE=full FREE_CLAUDE_CONTEXT_MAX_CHARS=30000 ./run.sh
 ```
 
-**需要完整源码时再开：**
+或先 export 再启动：
 
 ```bash
 export FREE_CLAUDE_CONTEXT=1
 export FREE_CLAUDE_CONTEXT_MODE=full
 export FREE_CLAUDE_CONTEXT_MAX_CHARS=30000
+./run.sh
 ```
 
 | 环境变量 | 说明 |
 |----------|------|
+| 设置位置 | **`./run.sh` 终端**（服务端）；`ANTHROPIC_*` 在 Claude Code 终端 |
 | `FREE_CLAUDE_PROJECT_ROOT` | 可选，手动指定项目根（默认从 Claude Code 工作目录自动识别） |
-| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入（最快） |
-| `FREE_CLAUDE_CONTEXT=1` | 开启注入（默认） |
-| `FREE_CLAUDE_CONTEXT_MODE` | `tree`（默认，仅目录树）/ `lite`（目录树 + README 等关键文件）/ `full`（尽量注入全部源码） |
-| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限；`full` 模式默认 20000，建议 30000 |
+| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入（`run.sh` 默认，最快） |
+| `FREE_CLAUDE_CONTEXT=1` | 开启注入 |
+| `FREE_CLAUDE_CONTEXT_MODE` | `tree`（`run.sh` 默认）/ `lite` / `full` |
+| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限；`full` 模式建议 30000 |
 | `FREE_CLAUDE_CONTEXT_ALWAYS=1` | 每轮 API 都重新扫描项目（默认仅会话首轮） |
 
 重启 `./run.sh` 后，终端会打印耗时日志，便于排查慢在哪一步：

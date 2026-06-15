@@ -243,8 +243,18 @@ setup_wsl_display_hint() {
   fi
 }
 
+setup_context_env() {
+  # 项目上下文：在 run.sh 内默认关闭注入（最快）。启动前 export 可覆盖，例如:
+  #   FREE_CLAUDE_CONTEXT=1 FREE_CLAUDE_CONTEXT_MODE=full ./run.sh
+  export FREE_CLAUDE_CONTEXT="${FREE_CLAUDE_CONTEXT:-0}"
+  export FREE_CLAUDE_CONTEXT_MODE="${FREE_CLAUDE_CONTEXT_MODE:-tree}"
+  export FREE_CLAUDE_CONTEXT_MAX_CHARS="${FREE_CLAUDE_CONTEXT_MAX_CHARS:-20000}"
+  echo "[run.sh] 项目上下文: CONTEXT=${FREE_CLAUDE_CONTEXT} MODE=${FREE_CLAUDE_CONTEXT_MODE} MAX=${FREE_CLAUDE_CONTEXT_MAX_CHARS}"
+}
+
 main() {
   parse_args "$@"
+  setup_context_env
   ensure_venv
   ensure_python_deps
   ensure_playwright_browser
