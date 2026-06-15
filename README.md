@@ -126,6 +126,7 @@ export FREE_CLAUDE_CONTEXT_MAX_CHARS=30000
 | 环境变量 | 说明 |
 |----------|------|
 | 设置位置 | **`./run.sh` 终端**（服务端）；`ANTHROPIC_*` 在 Claude Code 终端 |
+| 在 free-claude 目录跑 claude | 正常，默认 `CONTEXT=0` 不注入；若要注入本项目：`FREE_CLAUDE_PROJECT_ROOT=$(pwd) FREE_CLAUDE_CONTEXT=1 ./run.sh` |
 | `FREE_CLAUDE_PROJECT_ROOT` | 可选，手动指定项目根（默认从 Claude Code 工作目录自动识别） |
 | `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入（`run.sh` 默认，最快） |
 | `FREE_CLAUDE_CONTEXT=1` | 开启注入 |

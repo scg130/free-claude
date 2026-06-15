@@ -95,7 +95,7 @@ def _is_proxy_install_dir(path: Path) -> bool:
         return False
 
 
-def _normalize_path(raw: str) -> Path | None:
+def _normalize_path(raw: str, *, allow_proxy: bool = False) -> Path | None:
     raw = raw.strip().strip("`'\".,;:")
     if not raw:
         return None
@@ -103,7 +103,9 @@ def _normalize_path(raw: str) -> Path | None:
         path = Path(raw).expanduser().resolve()
     except OSError:
         return None
-    if not path.is_dir() or _is_proxy_install_dir(path):
+    if not path.is_dir():
+        return None
+    if not allow_proxy and _is_proxy_install_dir(path):
         return None
     return path
 
@@ -225,7 +227,7 @@ def resolve_project_root(
     """解析用户项目根目录：Claude Code 工作目录，而非 free-claude 安装目录。"""
     env_root = os.environ.get("FREE_CLAUDE_PROJECT_ROOT", "").strip()
     if env_root:
-        path = _normalize_path(env_root)
+        path = _normalize_path(env_root, allow_proxy=True)
         if path:
             _save_cached_root(path)
             return path
@@ -260,7 +262,7 @@ def is_conversation_start(messages: list[dict]) -> bool:
 
 
 def should_inject_context(messages: list[dict], tools: list[dict] | None) -> bool:
-    if os.environ.get("FREE_CLAUDE_CONTEXT", "1").lower() in ("0", "false", "no"):
+    if os.environ.get("FREE_CLAUDE_CONTEXT", "0").lower() in ("0", "false", "no"):
         return False
     if os.environ.get("FREE_CLAUDE_CONTEXT_ALWAYS", "").lower() in ("1", "true", "yes"):
         return True
@@ -361,6 +363,19 @@ def build_project_context(root: Path) -> str:
     return "".join(parts)
 
 
+def _working_dir_from_blob(blob: str) -> Path | None:
+    for pattern in _CWD_PATTERNS:
+        for match in pattern.finditer(blob):
+            raw = match.group(1).strip(" `'\".,;:")
+            if not raw:
+                continue
+            try:
+                return Path(raw).expanduser().resolve()
+            except OSError:
+                continue
+    return None
+
+
 def maybe_project_context(
     messages: list[dict],
     system: str | list | None,
@@ -370,10 +385,19 @@ def maybe_project_context(
         return ""
     root = resolve_project_root(system, messages)
     if not root:
-        print(
-            "[context] 未识别到用户项目目录（请在项目目录运行 claude，"
-            "或设置 FREE_CLAUDE_PROJECT_ROOT=$(pwd)）"
-        )
+        blob = _collect_prompt_texts(system, messages)
+        cwd = _working_dir_from_blob(blob) if blob else None
+        if cwd and _is_proxy_install_dir(cwd):
+            print(
+                "[context] 当前在 free-claude 目录运行 claude；"
+                "分析业务项目请 cd 到项目目录，"
+                "或在 run.sh 终端: export FREE_CLAUDE_PROJECT_ROOT=/path/to/project"
+            )
+        else:
+            print(
+                "[context] 未识别项目目录；请在项目目录运行 claude，"
+                "或在 run.sh 终端: export FREE_CLAUDE_PROJECT_ROOT=/path/to/project"
+            )
         return ""
     ctx = build_project_context(root)
     if ctx:
