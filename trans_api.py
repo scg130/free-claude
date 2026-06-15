@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from project_context import maybe_project_context
+
 from providers import get_provider, list_models, shutdown_all, startup_all
 from providers.doubao.browser import session_ready as doubao_session_ready
 from providers.deepseek.browser import session_ready as deepseek_session_ready
@@ -69,15 +71,23 @@ async def _run_chat(
 ) -> tuple[Any, str]:
     provider = get_provider(_resolve_model(model))
     conv_id = get_conv_id()
+    project_context = maybe_project_context(messages, system, tools)
 
     if tools:
         result = await provider.chat_agent(
-            messages, conv_id, system=system, tools=tools, model=model
+            messages,
+            conv_id,
+            system=system,
+            tools=tools,
+            model=model,
+            project_context=project_context,
         )
     else:
         user_prompt = _extract_user_text(messages)
         if not user_prompt:
             raise HTTPException(status_code=400, detail="未检测到用户提问")
+        if project_context:
+            user_prompt = f"{project_context}\n\n## 用户问题\n{user_prompt}"
         result = await provider.chat(user_prompt, conv_id)
 
     if not result.content and not result.content_blocks:

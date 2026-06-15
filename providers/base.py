@@ -58,11 +58,12 @@ class ChatProvider(ABC):
         system: str | list | None = None,
         tools: list[dict] | None = None,
         model: str | None = None,
+        project_context: str = "",
     ) -> ChatResult:
         """Agent 模式：支持 tools 时默认走 chat（子类可覆盖）。"""
         from providers.anthropic_bridge import build_agent_prompt, parse_agent_response, to_anthropic_content
 
-        prompt = build_agent_prompt(messages, system, tools)
+        prompt = build_agent_prompt(messages, system, tools, project_context=project_context)
         raw = await self.chat(prompt, conv_id)
         if not tools:
             return raw

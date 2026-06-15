@@ -63,9 +63,14 @@ def build_agent_prompt(
     messages: list[dict],
     system: str | list | None,
     tools: list[dict] | None,
+    *,
+    project_context: str = "",
 ) -> str:
     """把 Anthropic 多轮对话 + 工具定义压成豆包可读的单一 prompt。"""
     sections: list[str] = []
+
+    if project_context:
+        sections.append(project_context.strip())
 
     if system:
         if isinstance(system, str):

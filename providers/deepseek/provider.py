@@ -32,7 +32,12 @@ class DeepSeekProvider(ChatProvider):
         system: str | list | None = None,
         tools: list[dict] | None = None,
         model: str | None = None,
+        project_context: str = "",
     ) -> ChatResult:
         return await client.chat_agent(
-            messages, system=system, tools=tools, model=model
+            messages,
+            system=system,
+            tools=tools,
+            model=model,
+            project_context=project_context,
         )

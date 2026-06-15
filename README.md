@@ -79,11 +79,21 @@ curl -s -X POST http://127.0.0.1:8000/v1/messages \
 
 3. Agent 写文件（需授权 + 重启 `./run.sh` 加载最新 bridge）：
 
+**项目上下文（自动）：** 在**你的项目目录**下运行 `claude`（`cd your-project && claude`），会从 Claude Code 的 system 里读取 **working directory**，自动注入该目录源码（**不是** free-claude 安装目录）。
+
 ```bash
+cd /path/to/your-project          # 你的项目
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=sk-any
 claude --model deepseek-coder --permission-mode bypassPermissions -p "写一个快速排序到 test.py"
 ```
+
+| 环境变量 | 说明 |
+|----------|------|
+| `FREE_CLAUDE_PROJECT_ROOT` | 可选，手动指定项目根（默认从 Claude Code 工作目录自动识别） |
+| `FREE_CLAUDE_CONTEXT=0` | 关闭项目上下文注入 |
+| `FREE_CLAUDE_CONTEXT_ALWAYS=1` | 每轮 API 都重新扫描（默认仅会话首轮） |
+| `FREE_CLAUDE_CONTEXT_MAX_CHARS` | 上下文总字符上限，默认 80000 |
 
 `-p` 会执行工具，但必须加 `--permission-mode bypassPermissions`（或 `--dangerously-skip-permissions`），否则 Write 不会落盘。
 

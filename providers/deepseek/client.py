@@ -146,9 +146,12 @@ async def chat_agent(
     system: str | list | None = None,
     tools: list[dict] | None = None,
     model: str | None = None,
+    project_context: str = "",
 ) -> ChatResult:
     if tools:
-        prompt = build_agent_prompt(messages, system, tools)
+        prompt = build_agent_prompt(
+            messages, system, tools, project_context=project_context
+        )
         user_hint = _extract_user_text(messages)
         raw = await _web_completion(prompt, model=model)
         agent = parse_agent_response(raw, user_hint=user_hint)
