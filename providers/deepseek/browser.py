@@ -2,6 +2,11 @@
 
 import asyncio
 import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -12,6 +17,7 @@ PARAM_FILE = provider_param_file(PROVIDER_ID)
 PROFILE_DIR = provider_profile_dir(PROVIDER_ID)
 CHAT_URL = "https://chat.deepseek.com/"
 DEBUG_PORT = 9333
+_PROFILE_LOCK_NAMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 _browser_lock = asyncio.Lock()
 _playwright = None
@@ -24,8 +30,77 @@ _captured_hif_leim: str = ""
 
 _PROFILE_IN_USE_MSG = (
     "DeepSeek 浏览器配置目录已被占用（.profiles/deepseek）。"
-    "请先关闭已打开的 DeepSeek 浏览器窗口，或停止 ./run.sh 后再运行 python deepseek_auth.py。"
+    "请先关闭已打开的 DeepSeek/Chrome 窗口，或重新运行 ./run.sh（会自动清理残留锁）。"
+    "WSL 若仍失败: ./run.sh --reinstall-system-deps"
 )
+
+
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _profile_process_alive(profile_dir: Path) -> bool:
+    needle = str(profile_dir.resolve())
+    if sys.platform == "win32":
+        return False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", needle],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _profile_lock_paths(profile_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for name in _PROFILE_LOCK_NAMES:
+        paths.append(profile_dir / name)
+        paths.append(profile_dir / "Default" / name)
+    return paths
+
+
+def _clear_stale_profile_lock(profile_dir: Path) -> bool:
+    """Chrome 异常退出后可能残留 Singleton* 锁；无 live 进程时安全删除。"""
+    profile_dir = Path(profile_dir)
+    lock_paths = [p for p in _profile_lock_paths(profile_dir) if p.exists() or p.is_symlink()]
+    if not lock_paths:
+        return False
+    if _port_open(DEBUG_PORT) or _profile_process_alive(profile_dir):
+        return False
+
+    removed = False
+    for path in lock_paths:
+        try:
+            path.unlink(missing_ok=True)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def _chromium_launch_args() -> list[str]:
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        f"--remote-debugging-port={DEBUG_PORT}",
+    ]
+    if _is_wsl() or sys.platform == "linux":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+    return args
 
 
 def _save_session(ds_session_id: str, authorization: str) -> dict:
@@ -264,30 +339,35 @@ async def _launch_persistent(*, headless: bool) -> Page:
 
     _via_cdp = False
     _cdp_browser = None
+    launch_args = _chromium_launch_args()
+    last_exc: Exception | None = None
 
-    try:
-        _context = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=headless,
-            viewport={"width": 1280, "height": 800},
-            locale="zh-CN",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                f"--remote-debugging-port={DEBUG_PORT}",
-            ],
-        )
-    except Exception as exc:
-        page = await _connect_via_cdp()
-        if page:
-            print("[deepseek] 配置目录被占用，已连接到现有浏览器会话")
-            return page
-        raise RuntimeError(_PROFILE_IN_USE_MSG) from exc
+    for attempt in range(2):
+        try:
+            _context = await _playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=headless,
+                viewport={"width": 1280, "height": 800},
+                locale="zh-CN",
+                args=launch_args,
+            )
+            _page = _context.pages[0] if _context.pages else await _context.new_page()
+            _attach_auth_listener(_page)
+            await _page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
+            await _page.wait_for_timeout(2000)
+            return _page
+        except Exception as exc:
+            last_exc = exc
+            page = await _connect_via_cdp()
+            if page:
+                print("[deepseek] 配置目录被占用，已连接到现有浏览器会话")
+                return page
+            if attempt == 0 and _clear_stale_profile_lock(PROFILE_DIR):
+                print("[deepseek] 已清除残留 profile 锁，正在重试启动浏览器…")
+                continue
+            break
 
-    _page = _context.pages[0] if _context.pages else await _context.new_page()
-    _attach_auth_listener(_page)
-    await _page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-    await _page.wait_for_timeout(2000)
-    return _page
+    raise RuntimeError(_PROFILE_IN_USE_MSG) from last_exc
 
 
 async def _ensure_page(*, headless: bool) -> Page:
@@ -297,6 +377,7 @@ async def _ensure_page(*, headless: bool) -> Page:
         return _page
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_stale_profile_lock(PROFILE_DIR)
 
     page = await _connect_via_cdp()
     if page:

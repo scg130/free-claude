@@ -144,3 +144,4 @@ mitmweb -s mitm_addon.py -p 8080 --ssl-insecure
 | `Not logged in · Please run /login` | 设置 `ANTHROPIC_API_KEY=sk-any` |
 | 只聊天不写文件 | 重启 `./run.sh` 加载 Tool 桥接；见上文 Agent 章节 |
 | 说了要写但文件没出现 | 重启 `./run.sh` 加载最新 bridge；DeepSeek 若输出 `[调用 Write]` 现已自动解析为 `tool_use`；写文件需授权或使用 `claude --dangerously-skip-permissions` |
+| DeepSeek 浏览器被占用（WSL/Linux） | 重新运行 `./run.sh`；系统依赖有问题时：`./run.sh --reinstall-system-deps` |
