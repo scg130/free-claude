@@ -140,6 +140,8 @@ class DeepSeekConfig:
     reuse_session: bool
     login_wait_sec: int
     wasm_url: str
+    rate_limit_rpm: float
+    rate_limit_backoff_sec: float
 
     @classmethod
     def from_env(cls) -> "DeepSeekConfig":
@@ -153,6 +155,10 @@ class DeepSeekConfig:
             wasm_url=env_str(
                 "DEEPSEEK_POW_WASM_URL",
                 "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm",
+            ),
+            rate_limit_rpm=max(0.0, env_float("DEEPSEEK_RATE_LIMIT_RPM", 0.0)),
+            rate_limit_backoff_sec=max(
+                5.0, env_float("DEEPSEEK_RATE_LIMIT_BACKOFF_SEC", 30.0)
             ),
         )
 

@@ -1,8 +1,9 @@
 """DeepSeek 网页 chat.deepseek.com API 客户端（浏览器内 fetch，无需官方 API Key）。"""
 
+import asyncio
 import json
 
-from config import APP
+from config import APP, DEEPSEEK
 from providers.anthropic_bridge import (
     extract_user_text,
     run_agent_parse_loop,
@@ -11,11 +12,24 @@ from providers.anthropic_bridge import (
 from providers.base import ChatResult
 from providers.deepseek import browser
 from providers.rate_limit import get_limiter
-from providers.retry import is_transient_error, with_retry
+from providers.retry import is_transient_error
 
 WEB_BASE = "https://chat.deepseek.com"
 API_PREFIX = "/api/v0"
 COMPLETION_PATH = "/api/v0/chat/completion"
+
+
+class DeepSeekRateLimitError(RuntimeError):
+    """DeepSeek SSE 返回 rate_limit_reached。"""
+
+
+def _deepseek_rpm() -> float:
+    """DeepSeek 网页端限流比全局更严，默认 cap 12/min。"""
+    if DEEPSEEK.rate_limit_rpm > 0:
+        return DEEPSEEK.rate_limit_rpm
+    if APP.rate_limit_rpm <= 0:
+        return 12.0
+    return min(APP.rate_limit_rpm, 12.0)
 
 
 def api_key_ready() -> bool:
@@ -39,7 +53,29 @@ def _model_flags(model: str | None) -> tuple[str, bool]:
     return model_type, thinking
 
 
+def _check_sse_rate_limit(raw: str) -> None:
+    """解析 event: hint 中的 rate_limit_reached（无 RESPONSE 正文时也会出现）。"""
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("finish_reason") != "rate_limit_reached" and obj.get("type") != "error":
+            continue
+        content = str(obj.get("content") or "")
+        if obj.get("finish_reason") == "rate_limit_reached" or "频繁" in content:
+            raise DeepSeekRateLimitError(content or "消息发送过于频繁，请稍后重试")
+
+
 def _parse_sse(raw: str, *, include_thinking: bool = False) -> str:
+    _check_sse_rate_limit(raw)
     think_parts: list[str] = []
     response_parts: list[str] = []
     current_kind: str | None = None
@@ -116,7 +152,7 @@ async def _web_completion(
     retried: bool = False,
 ) -> str:
     model_type, thinking = _model_flags(model)
-    await get_limiter("deepseek", APP.rate_limit_rpm).acquire()
+    last_rate_limit: DeepSeekRateLimitError | None = None
 
     async def _call() -> str:
         raw = await browser.chat_via_browser(
@@ -136,16 +172,40 @@ async def _web_completion(
         body = raw.get("body", "")
         text = _parse_sse(body, include_thinking=thinking)
         if not text:
+            _check_sse_rate_limit(body)
             raise RuntimeError(f"DeepSeek 未返回文本，响应片段: {body[:500]}")
         return text
 
-    return await with_retry(
-        _call,
-        max_attempts=APP.retry_max,
-        base_delay=APP.retry_base_delay,
-        retry_if=is_transient_error,
-        label="deepseek",
-    )
+    for attempt in range(1, APP.retry_max + 1):
+        await get_limiter("deepseek", _deepseek_rpm()).acquire()
+        try:
+            return await _call()
+        except DeepSeekRateLimitError as exc:
+            last_rate_limit = exc
+            if attempt >= APP.retry_max:
+                break
+            wait = DEEPSEEK.rate_limit_backoff_sec * attempt
+            print(
+                f"[deepseek] 限流({exc})，{wait:.0f}s 后重试 "
+                f"({attempt}/{APP.retry_max})…"
+            )
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            if attempt >= APP.retry_max or not is_transient_error(exc):
+                raise
+            delay = APP.retry_base_delay * (2 ** (attempt - 1))
+            print(f"[retry] deepseek 第 {attempt} 次失败({exc})，{delay:.1f}s 后重试…")
+            await asyncio.sleep(delay)
+
+    if last_rate_limit is not None:
+        rpm = _deepseek_rpm()
+        raise RuntimeError(
+            f"DeepSeek 限流: {last_rate_limit}。"
+            f"请等待 1–2 分钟后重试；可在 .env 设置 DEEPSEEK_RATE_LIMIT_RPM={max(6, int(rpm) - 2)} "
+            f"或增大 DEEPSEEK_RATE_LIMIT_BACKOFF_SEC（当前退避 {DEEPSEEK.rate_limit_backoff_sec:.0f}s）"
+        ) from last_rate_limit
+
+    raise RuntimeError("DeepSeek 请求失败")
 
 
 async def chat_completion(prompt: str, model: str | None = None) -> ChatResult:

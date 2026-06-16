@@ -199,6 +199,64 @@ def _wants_read(raw: str, user_hint: str) -> bool:
     return any(marker in blob for marker in _READ_INTENT_MARKERS)
 
 
+def _last_message_has_tool_result(messages: list[dict] | None) -> bool:
+    if not messages:
+        return False
+    last = messages[-1]
+    if last.get("role") != "user":
+        return False
+    content = last.get("content", "")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    )
+
+
+_TASK_COMPLETE_MARKERS = (
+    "已完成", "完成了", "修改完成", "添加完成", "已经成功", "已成功", "搞定了",
+    "任务完成", "已经添加", "已经修改", "已经更新", "无需再", "不需要再",
+    "修改已成功", "添加已成功", "变更已完成", "代码已更新",
+    "done", "completed", "finished", "all set", "successfully updated",
+    "no further", "that's all",
+)
+
+
+def _looks_like_task_complete(text: str) -> bool:
+    blob = (text or "").strip().lower()
+    if not blob:
+        return False
+    return any(m.lower() in blob for m in _TASK_COMPLETE_MARKERS)
+
+
+def _should_retry_for_tools(
+    raw: str, agent: AgentResult, messages: list[dict] | None
+) -> bool:
+    """仅在模型明显需要工具但未输出合法 JSON 时重试，避免任务完成后反复请求。"""
+    text = (agent.text or raw or "").strip()
+    if not text:
+        return True
+    if _last_message_has_tool_result(messages):
+        return False
+    if _looks_like_task_complete(text):
+        return False
+    if '{"tool_uses"' in raw or '"tool_uses"' in raw:
+        return True
+    if _wants_read(raw, ""):
+        return True
+    if len(text) >= 30:
+        return False
+    return False
+
+
+def _skip_tool_fallbacks(raw: str, messages: list[dict] | None) -> bool:
+    """工具执行后的总结、或明确完成语 — 禁止自动补 Read/Write。"""
+    if _last_message_has_tool_result(messages):
+        return True
+    return _looks_like_task_complete(raw)
+
+
 def _collapse_repetitive_text(text: str) -> str:
     """去掉模型在一轮回复里重复粘贴的同一句空话。"""
     lines = text.splitlines()
@@ -464,6 +522,10 @@ async def run_agent_parse_loop(
             log_if_missing=False,
         )
         if agent.tool_uses:
+            return agent
+        if not _should_retry_for_tools(last_raw, agent, messages):
+            if attempt > 1:
+                print("[bridge] 判定为任务完成/纯文本回复，停止重试")
             return agent
 
     if last_raw.strip():
@@ -782,6 +844,8 @@ def _read_json_string(text: str, start: int) -> tuple[str | None, int]:
 
 def _extract_write_from_partial_json(text: str) -> list[ToolUseBlock]:
     """JSON 无法完整解析时，从 tool_uses Write 片段提取 file_path / content。"""
+    if _looks_like_task_complete(text):
+        return []
     if '"tool_uses"' not in text and "<function_json>" not in text.lower():
         return []
 
@@ -1022,7 +1086,8 @@ def parse_agent_response(
 ) -> AgentResult:
     tool_names = _tool_names(tools)
     text, tool_uses = _extract_json_tool_block(raw, tool_names)
-    if not tool_uses:
+    skip_fallbacks = _skip_tool_fallbacks(raw, messages)
+    if not tool_uses and not skip_fallbacks:
         tool_uses = _fallback_write_from_fence(text or raw, user_hint)
         if tool_uses:
             text = re.sub(
@@ -1032,7 +1097,7 @@ def parse_agent_response(
                 flags=re.DOTALL | re.IGNORECASE,
             ).strip()
         tool_uses = _normalize_tool_uses(tool_uses, tool_names)
-    if not tool_uses:
+    if not tool_uses and not skip_fallbacks:
         tool_uses = _fallback_read_from_intent(
             raw,
             user_hint=user_hint,

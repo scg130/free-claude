@@ -43,6 +43,8 @@ def is_transient_error(exc: BaseException) -> bool:
         "502",
         "504",
         "429",
+        "rate_limit",
+        "频繁",
         "temporarily",
         "network",
         "econnreset",
