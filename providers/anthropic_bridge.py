@@ -59,6 +59,219 @@ def _tool_summary(tools: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _tool_names(tools: list[dict] | None) -> set[str]:
+    if not tools:
+        return set()
+    return {t.get("name", "") for t in tools if t.get("name")}
+
+
+def _parse_json_object(text: str) -> dict | None:
+    text = text.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _is_tool_parameter_obj(obj: dict) -> bool:
+    """模型常把 MCP/Read 参数误当成文件内容或裸 JSON 输出。"""
+    if not obj:
+        return False
+    keys = set(obj.keys())
+    if "tool_uses" in keys:
+        return False
+    if "symbol" in keys and ("includeCode" in keys or "projectPath" in keys):
+        return True
+    if "file_path" in keys and ("offset" in keys or "limit" in keys) and "content" not in keys:
+        return True
+    if keys <= {"file_path"} or keys <= {"path"}:
+        return True
+    if "query" in keys and len(keys) <= 3:
+        return True
+    return False
+
+
+def _is_tool_parameter_json(text: str) -> bool:
+    obj = _parse_json_object(text)
+    return bool(obj and _is_tool_parameter_obj(obj))
+
+
+def _infer_tool_from_params(obj: dict, tool_names: set[str]) -> tuple[str, dict] | None:
+    """把误输出的 MCP/Read 参数映射为 Claude Code 可执行的工具调用。"""
+    if "symbol" in obj:
+        mcp = "mcp__codegraph__codegraph_node"
+        if mcp in tool_names:
+            return mcp, obj
+    if "query" in obj:
+        mcp = "mcp__codegraph__codegraph_explore"
+        if mcp in tool_names:
+            return mcp, obj
+    file_path = obj.get("file_path") or obj.get("path")
+    if file_path and "content" not in obj:
+        inp: dict = {"file_path": file_path}
+        if "offset" in obj:
+            inp["offset"] = obj["offset"]
+        if "limit" in obj:
+            inp["limit"] = obj["limit"]
+        if "Read" in tool_names:
+            return "Read", inp
+    return None
+
+
+def _normalize_tool_block(
+    name: str, inp: dict, tool_names: set[str], tid: str
+) -> ToolUseBlock | None:
+    """修正 Write 误用、裸参数 JSON，避免把工具参数写进源文件。"""
+    if name == "Write":
+        content = inp.get("content", "")
+        if isinstance(content, str) and _is_tool_parameter_json(content):
+            inner = _parse_json_object(content)
+            if inner:
+                inferred = _infer_tool_from_params(inner, tool_names)
+                if inferred:
+                    new_name, new_inp = inferred
+                    print(f"[bridge] Write 内容实为工具参数，转为 {new_name}")
+                    return ToolUseBlock(id=tid, name=new_name, input=new_inp)
+            print("[bridge] 拒绝 Write：content 是工具参数 JSON，不是源码")
+            return None
+        if "content" not in inp or not str(inp.get("content", "")).strip():
+            if _is_tool_parameter_obj(inp):
+                inferred = _infer_tool_from_params(inp, tool_names)
+                if inferred:
+                    new_name, new_inp = inferred
+                    print(f"[bridge] Write 参数实为读文件/MCP，转为 {new_name}")
+                    return ToolUseBlock(id=tid, name=new_name, input=new_inp)
+            print("[bridge] 拒绝 Write：缺少有效 content")
+            return None
+    elif _is_tool_parameter_obj(inp):
+        inferred = _infer_tool_from_params(inp, tool_names)
+        if inferred:
+            new_name, new_inp = inferred
+            print(f"[bridge] 工具 {name} 参数不规范，转为 {new_name}")
+            return ToolUseBlock(id=tid, name=new_name, input=new_inp)
+    return ToolUseBlock(id=tid, name=name, input=inp)
+
+
+def _normalize_tool_uses(
+    tool_uses: list[ToolUseBlock], tool_names: set[str]
+) -> list[ToolUseBlock]:
+    out: list[ToolUseBlock] = []
+    for tu in tool_uses:
+        normalized = _normalize_tool_block(tu.name, tu.input, tool_names, tu.id)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+_FILE_PATH_RE = re.compile(
+    r"[`'\"]?((?:[\w.-]+/)*[\w.-]+\.(?:py|go|ts|tsx|js|jsx|rs|java|md|json|yaml|yml|sh))[`'\"]?",
+    re.IGNORECASE,
+)
+
+_READ_INTENT_MARKERS = (
+    "读取", "读一下", "读 ", "查看", "看看", "打开", "找到", "搜索", "定位", "查找",
+    "read ", "look at", "open ", "locate", "search for", "find ",
+)
+
+
+def _extract_target_file(*sources: str) -> str:
+    for source in sources:
+        if not source:
+            continue
+        for match in _FILE_PATH_RE.finditer(source):
+            path = match.group(1)
+            if path:
+                return path
+    return ""
+
+
+def _wants_read(raw: str, user_hint: str) -> bool:
+    blob = f"{raw} {user_hint}".lower()
+    return any(marker in blob for marker in _READ_INTENT_MARKERS)
+
+
+def _collapse_repetitive_text(text: str) -> str:
+    """去掉模型在一轮回复里重复粘贴的同一句空话。"""
+    lines = text.splitlines()
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        key = line.strip()
+        if not key:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _fallback_read_from_intent(
+    raw: str,
+    *,
+    user_hint: str = "",
+    messages: list[dict] | None = None,
+    tool_names: set[str],
+) -> list[ToolUseBlock]:
+    """模型口头说要读文件，却没输出 tool JSON 时，自动补 Read 调用。"""
+    if "Read" not in tool_names:
+        return []
+    if not _wants_read(raw, user_hint):
+        return []
+
+    sources = [user_hint, raw]
+    if messages:
+        sources.append(extract_user_text(messages))
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            sources.append(_block_text(msg.get("content", "")))
+            break
+
+    file_path = _extract_target_file(*sources)
+    if not file_path:
+        return []
+
+    print(f"[bridge] 口头读文件意图 → 自动 Read: {file_path}")
+    return [
+        ToolUseBlock(
+            id=f"toolu_{uuid.uuid4().hex[:12]}",
+            name="Read",
+            input={"file_path": file_path},
+        )
+    ]
+
+
+def _extract_read_from_partial_json(text: str) -> list[ToolUseBlock]:
+    """从被截断的 tool_uses Read JSON 中抢救 file_path。"""
+    if '"tool_uses"' not in text and '"name"' not in text:
+        return []
+    if not re.search(r'"name"\s*:\s*"Read"', text, re.IGNORECASE):
+        return []
+    fp_match = re.search(r'"file_path"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    if not fp_match:
+        return []
+    try:
+        file_path = json.loads(f'"{fp_match.group(1)}"')
+    except json.JSONDecodeError:
+        file_path = fp_match.group(1)
+    if not file_path:
+        return []
+    print(f"[bridge] 截断的 Read JSON 已修复: {file_path}")
+    return [
+        ToolUseBlock(
+            id="toolu_001",
+            name="Read",
+            input={"file_path": file_path},
+        )
+    ]
+
+
 def _truncate_text(text: str, limit: int) -> str:
     text = text.strip()
     if len(text) <= limit:
@@ -120,16 +333,21 @@ def build_agent_prompt(
             + _tool_summary(tools)
             + "\n\n## 工具调用格式\n"
             "当你需要读文件、写文件、执行命令时，在回复末尾单独一行输出 JSON（不要用 markdown 代码块包裹）：\n"
-            '{"tool_uses":[{"id":"toolu_001","name":"Write","input":{"file_path":"test.py","content":"代码内容"}}]}\n'
+            '{"tool_uses":[{"id":"toolu_001","name":"Read","input":{"file_path":"trans_api.py"}}]}\n'
+            '{"tool_uses":[{"id":"toolu_002","name":"Write","input":{"file_path":"trans_api.py","content":"完整源码"}}]}\n'
             "规则：\n"
             "- id 必须以 toolu_ 开头\n"
-            "- name 必须是上面列出的工具名之一\n"
+            "- name 必须是上面列出的工具名之一（含 mcp__ 开头的 MCP 工具）\n"
             "- input 必须符合该工具的参数\n"
+            "- 修改文件前必须先 Read 读取当前内容，禁止臆测文件内容\n"
+            "- Write 的 content 必须是完整源码，禁止把 Read/MCP 的参数 JSON 当作 content 写入\n"
+            "- 禁止只输出裸 JSON（如 {\"file_path\":...,\"offset\":...}），必须包在 tool_uses 里\n"
             "- 可同时输出说明文字 + 一行 JSON\n"
             "- 不需要工具时，只输出普通文字，不要输出 JSON\n"
             "- 禁止输出 [调用 Write]、[已调用 Bash]、[工具 xxx 返回]、### 用户 等格式\n"
             "- 禁止用 <function_json>、<bash>、<bash_command>、<write>、<read>、<tool_call> 等 XML 标签\n"
             "- 禁止说「让我先搜索/读取/查看代码库」却不输出工具 JSON\n"
+            "- 禁止只写「我来读取 xxx」而不在末尾附上 tool JSON；需要读文件时必须输出 Read 的 tool_uses\n"
             "- 问答/对比/解释类问题：直接用文字完整回答，不要调用工具\n"
             "- 禁止模拟工具执行结果或多轮对话，只输出当前这一轮助手回复\n"
             "- 每次只调用一个工具，等待结果后再继续"
@@ -189,8 +407,9 @@ def extract_user_text(messages: list[dict]) -> str:
 _TOOL_RETRY_SUFFIX = (
     "\n\n## 系统提醒\n"
     "上次回复未包含合法 tool JSON（`{\"tool_uses\":[...]}`）。"
+    "若需读文件，用 Read 工具；写文件前必须先 Read。"
     "若需读文件、写文件或执行命令，必须在回复**末尾单独一行**输出工具 JSON。"
-    "不要只用文字描述操作。"
+    "不要把工具参数 JSON 写进 Write 的 content。"
 )
 
 
@@ -217,7 +436,13 @@ async def run_agent_parse_loop(
         if attempt > 1:
             print(f"[bridge] 未解析到 tool_use，第 {attempt}/{attempts} 次重试…")
         last_raw = await fetch_raw(prompt)
-        agent = parse_agent_response(last_raw, user_hint=user_hint, log_if_missing=False)
+        agent = parse_agent_response(
+            last_raw,
+            user_hint=user_hint,
+            messages=messages,
+            tools=tools,
+            log_if_missing=False,
+        )
         if agent.tool_uses:
             return agent
 
@@ -606,7 +831,7 @@ def _decode_json_object_loose(text: str, start: int) -> tuple[dict | None, int]:
     return None, start
 
 
-def _tool_uses_from_object(obj: dict) -> list[ToolUseBlock]:
+def _tool_uses_from_object(obj: dict, tool_names: set[str]) -> list[ToolUseBlock]:
     tool_uses: list[ToolUseBlock] = []
     for item in obj.get("tool_uses", []):
         name = item.get("name", "")
@@ -618,10 +843,12 @@ def _tool_uses_from_object(obj: dict) -> list[ToolUseBlock]:
         tool_uses.append(
             ToolUseBlock(id=tid, name=name, input=item.get("input") or {})
         )
-    return tool_uses
+    return _normalize_tool_uses(tool_uses, tool_names)
 
 
-def _extract_tool_uses_object(text: str) -> tuple[str, list[ToolUseBlock]]:
+def _extract_tool_uses_object(
+    text: str, tool_names: set[str]
+) -> tuple[str, list[ToolUseBlock]]:
     """用 JSONDecoder 解析 {\"tool_uses\":[...]}，避免 content 里的 ] 截断正则。"""
     tool_uses: list[ToolUseBlock] = []
     search_from = 0
@@ -640,7 +867,7 @@ def _extract_tool_uses_object(text: str) -> tuple[str, list[ToolUseBlock]]:
             search_from = key_idx + 1
             continue
         found_span = (obj_start, end)
-        tool_uses = _tool_uses_from_object(obj)
+        tool_uses = _tool_uses_from_object(obj, tool_names)
         break
 
     if not tool_uses or not found_span:
@@ -658,37 +885,74 @@ def _extract_tool_uses_object(text: str) -> tuple[str, list[ToolUseBlock]]:
     return clean, tool_uses
 
 
-def _extract_json_tool_block(text: str) -> tuple[str, list[ToolUseBlock]]:
-    """从模型回复中解析 tool_uses JSON，返回 (纯文本, 工具列表)。"""
-    text = _truncate_hallucinated_turns(text)
+def _extract_standalone_json_tool_calls(
+    text: str, tool_names: set[str]
+) -> tuple[str, list[ToolUseBlock]]:
+    """解析模型只输出一行裸 JSON 参数（未包在 tool_uses 里）的情况。"""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{") or not stripped.endswith("}"):
+            continue
+        obj = _parse_json_object(stripped)
+        if not obj or not _is_tool_parameter_obj(obj):
+            continue
+        inferred = _infer_tool_from_params(obj, tool_names)
+        if not inferred:
+            continue
+        name, inp = inferred
+        clean = text.replace(line, "", 1).strip()
+        print(f"[bridge] 裸 JSON 参数已转为 {name} 工具调用")
+        return clean, [
+            ToolUseBlock(id=f"toolu_{uuid.uuid4().hex[:12]}", name=name, input=inp)
+        ]
+    return text.strip(), []
 
-    clean, tool_uses = _extract_tool_call_tag_tool_calls(text)
+
+def _extract_json_tool_block(
+    text: str, tool_names: set[str]
+) -> tuple[str, list[ToolUseBlock]]:
+    """从模型回复中解析 tool_uses JSON，返回 (纯文本, 工具列表)。"""
+    text = _collapse_repetitive_text(_truncate_hallucinated_turns(text))
+
+    clean, tool_uses = _extract_standalone_json_tool_calls(text, tool_names)
     if tool_uses:
         return clean, tool_uses
 
+    clean, tool_uses = _extract_tool_call_tag_tool_calls(text)
+    if tool_uses:
+        return clean, _normalize_tool_uses(tool_uses, tool_names)
+
     text = _unwrap_tool_markup(text)
 
-    clean, tool_uses = _extract_tool_uses_object(text)
+    clean, tool_uses = _extract_tool_uses_object(text, tool_names)
     if tool_uses:
         return clean, tool_uses
 
     clean, tool_uses = _extract_xml_tag_tool_calls(text)
     if tool_uses:
-        return clean, tool_uses
+        return clean, _normalize_tool_uses(tool_uses, tool_names)
 
     clean, tool_uses = _extract_bracket_tool_calls(text)
     if tool_uses:
-        return clean, tool_uses
+        return clean, _normalize_tool_uses(tool_uses, tool_names)
 
     clean, tool_uses = _extract_history_tool_calls(text)
     if tool_uses:
-        return clean, tool_uses
+        return clean, _normalize_tool_uses(tool_uses, tool_names)
 
     partial = _extract_write_from_partial_json(text)
     if partial:
         json_start = text.find("{")
         clean = text[:json_start].strip() if json_start >= 0 else ""
-        return clean, partial
+        normalized = _normalize_tool_uses(partial, tool_names)
+        if normalized:
+            return clean, normalized
+
+    partial_read = _extract_read_from_partial_json(text)
+    if partial_read:
+        json_start = text.find("{")
+        clean = text[:json_start].strip() if json_start >= 0 else ""
+        return clean, _normalize_tool_uses(partial_read, tool_names)
 
     return text.strip(), []
 
@@ -701,15 +965,23 @@ def _fallback_write_from_fence(text: str, user_hint: str = "") -> list[ToolUseBl
     content = fence.group(1).strip()
     if len(content) < 10:
         return []
+    if content.startswith("{") and _is_tool_parameter_json(content):
+        return []
 
-    file_path = "test.py"
-    m = re.search(r"[`'\"]?([\w./_-]+\.py)[`'\"]?", user_hint)
-    if m:
-        file_path = m.group(1).split("/")[-1]
-    else:
-        m2 = re.search(r"[`'\"]?([\w./_-]+\.py)[`'\"]?", text)
-        if m2:
-            file_path = m2.group(1).split("/")[-1]
+    file_path = ""
+    for pattern in (
+        r"[`'\"]?([\w./_-]+\.py)[`'\"]?",
+        r"[`'\"]?([\w./_-]+\.(?:go|ts|js|tsx|jsx|rs|java))[`'\"]?",
+    ):
+        for source in (user_hint, text):
+            m = re.search(pattern, source)
+            if m:
+                file_path = m.group(1).split("/")[-1]
+                break
+        if file_path:
+            break
+    if not file_path:
+        return []
 
     return [
         ToolUseBlock(
@@ -721,13 +993,34 @@ def _fallback_write_from_fence(text: str, user_hint: str = "") -> list[ToolUseBl
 
 
 def parse_agent_response(
-    raw: str, *, user_hint: str = "", log_if_missing: bool = True
+    raw: str,
+    *,
+    user_hint: str = "",
+    messages: list[dict] | None = None,
+    tools: list[dict] | None = None,
+    log_if_missing: bool = True,
 ) -> AgentResult:
-    text, tool_uses = _extract_json_tool_block(raw)
+    tool_names = _tool_names(tools)
+    text, tool_uses = _extract_json_tool_block(raw, tool_names)
     if not tool_uses:
         tool_uses = _fallback_write_from_fence(text or raw, user_hint)
         if tool_uses:
-            text = re.sub(r"```(?:python)?\s*\n.*?```", "", text or raw, flags=re.DOTALL | re.IGNORECASE).strip()
+            text = re.sub(
+                r"```(?:python)?\s*\n.*?```",
+                "",
+                text or raw,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+        tool_uses = _normalize_tool_uses(tool_uses, tool_names)
+    if not tool_uses:
+        tool_uses = _fallback_read_from_intent(
+            raw,
+            user_hint=user_hint,
+            messages=messages,
+            tool_names=tool_names,
+        )
+        if tool_uses:
+            text = ""
     if len(tool_uses) > 1:
         tool_uses = tool_uses[:1]
     if not tool_uses and raw.strip() and log_if_missing:
