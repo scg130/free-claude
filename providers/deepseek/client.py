@@ -23,15 +23,6 @@ class DeepSeekRateLimitError(RuntimeError):
     """DeepSeek SSE 返回 rate_limit_reached。"""
 
 
-def _deepseek_rpm() -> float:
-    """DeepSeek 网页端限流比全局更严，默认 cap 12/min。"""
-    if DEEPSEEK.rate_limit_rpm > 0:
-        return DEEPSEEK.rate_limit_rpm
-    if APP.rate_limit_rpm <= 0:
-        return 12.0
-    return min(APP.rate_limit_rpm, 12.0)
-
-
 def api_key_ready() -> bool:
     return browser.session_ready()
 
@@ -177,7 +168,7 @@ async def _web_completion(
         return text
 
     for attempt in range(1, APP.retry_max + 1):
-        await get_limiter("deepseek", _deepseek_rpm()).acquire()
+        await get_limiter("deepseek", DEEPSEEK.rate_limit_rpm).acquire()
         try:
             return await _call()
         except DeepSeekRateLimitError as exc:
@@ -198,11 +189,10 @@ async def _web_completion(
             await asyncio.sleep(delay)
 
     if last_rate_limit is not None:
-        rpm = _deepseek_rpm()
         raise RuntimeError(
             f"DeepSeek 限流: {last_rate_limit}。"
-            f"请等待 1–2 分钟后重试；可在 .env 设置 DEEPSEEK_RATE_LIMIT_RPM={max(6, int(rpm) - 2)} "
-            f"或增大 DEEPSEEK_RATE_LIMIT_BACKOFF_SEC（当前退避 {DEEPSEEK.rate_limit_backoff_sec:.0f}s）"
+            f"请等待 1–2 分钟后重试；可增大 REQUEST_INTERVAL_SEC 或 "
+            f"DEEPSEEK_RATE_LIMIT_BACKOFF_SEC（当前退避 {DEEPSEEK.rate_limit_backoff_sec:.0f}s）"
         ) from last_rate_limit
 
     raise RuntimeError("DeepSeek 请求失败")

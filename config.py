@@ -98,6 +98,7 @@ class AppConfig:
     retry_max: int
     retry_base_delay: float
     rate_limit_rpm: float
+    request_interval_sec: float
     credential_check_interval: int
     fetch_timeout_ms: int
 
@@ -107,6 +108,7 @@ class AppConfig:
             retry_max=max(1, env_int("RETRY_MAX", 3)),
             retry_base_delay=max(0.1, env_float("RETRY_BASE_DELAY", 1.0)),
             rate_limit_rpm=max(0.0, env_float("RATE_LIMIT_RPM", 30.0)),
+            request_interval_sec=max(0.0, env_float("REQUEST_INTERVAL_SEC", 1.5)),
             credential_check_interval=max(0, env_int("CREDENTIAL_CHECK_INTERVAL", 3600)),
             fetch_timeout_ms=max(30_000, env_int("FETCH_TIMEOUT_MS", 180_000)),
         )
