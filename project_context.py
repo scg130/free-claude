@@ -12,6 +12,7 @@ from config import CONTEXT as CONTEXT_CFG
 from paths import ROOT_DIR
 
 PROXY_DIR = ROOT_DIR.resolve()
+CACHED_ROOT_FILE = PROXY_DIR / ".cache" / "active-project-root.txt"
 
 DEFAULT_IGNORE_DIRS = frozenset({
     ".git",
@@ -44,11 +45,11 @@ PROJECT_MARKERS = (
     "README.md",
 )
 
-# Claude Code 默认 system 里 # Environment 段含 working directory
+# Claude Code / Cursor 在 system 或 user_info 里传入工作目录
 _CWD_PATTERNS = (
     re.compile(
         r"(?:working directory|工作目录|current directory|当前工作目录|"
-        r"project directory|项目目录|cwd|workspace folder|工作区)"
+        r"project directory|项目目录|cwd|workspace folder|工作区|workspace path)"
         r"\s*[:：=]\s*[`'\"]?([^\s\n`'\"<>]+)",
         re.I,
     ),
@@ -59,6 +60,7 @@ _CWD_PATTERNS = (
         re.I,
     ),
     re.compile(r"<working_directory>\s*([^\s<]+)\s*</working_directory>", re.I),
+    re.compile(r"Workspace Path:\s*([^\s\n]+)", re.I),
 )
 
 _ABS_PATH = re.compile(
@@ -101,11 +103,31 @@ def _normalize_path(raw: str, *, allow_proxy: bool = False) -> Path | None:
         path = Path(raw).expanduser().resolve()
     except OSError:
         return None
+    if path.is_file():
+        path = path.parent
     if not path.is_dir():
         return None
     if not allow_proxy and _is_proxy_install_dir(path):
         return None
     return path
+
+
+def _save_cached_root(path: Path) -> None:
+    try:
+        CACHED_ROOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHED_ROOT_FILE.write_text(str(path.resolve()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_cached_root() -> Path | None:
+    try:
+        if not CACHED_ROOT_FILE.is_file():
+            return None
+        raw = CACHED_ROOT_FILE.read_text(encoding="utf-8").strip()
+        return _normalize_path(raw, allow_proxy=True)
+    except OSError:
+        return None
 
 
 def _collect_prompt_texts(
@@ -122,8 +144,15 @@ def _collect_prompt_texts(
 
     if messages:
         for msg in messages:
+            role = msg.get("role", "")
             content = msg.get("content", "")
-            if isinstance(content, str):
+            if role == "system" and isinstance(content, str):
+                parts.append(content)
+            elif role == "system" and isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+            elif isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
                 for block in content:
@@ -146,7 +175,7 @@ def _score_project_dir(path: Path) -> int:
     return score
 
 
-def _guess_from_absolute_paths(text: str) -> Path | None:
+def _guess_from_absolute_paths(text: str, *, allow_proxy: bool = False) -> Path | None:
     best: Path | None = None
     best_score = -1
     seen: set[str] = set()
@@ -155,23 +184,25 @@ def _guess_from_absolute_paths(text: str) -> Path | None:
         if raw in seen:
             continue
         seen.add(raw)
-        path = _normalize_path(raw)
+        path = _normalize_path(raw, allow_proxy=allow_proxy)
         if not path:
             continue
         score = _score_project_dir(path)
-        # 文件路径 → 向上找含项目标记的目录
-        if score == 0 and path.is_file():
-            for parent in path.parents:
-                if _is_proxy_install_dir(parent):
-                    break
-                parent_score = _score_project_dir(parent)
-                if parent_score > 0:
-                    path = parent
-                    score = parent_score
-                    break
         if score > best_score:
             best, best_score = path, score
     return best
+
+
+def _guess_from_user_info(text: str) -> Path | None:
+    """从 Cursor / Claude Code 的 <user_info> 段解析工作区。"""
+    if "user_info" not in text.lower() and "workspace path" not in text.lower():
+        return None
+    for pattern in _CWD_PATTERNS:
+        for match in pattern.finditer(text):
+            path = _normalize_path(match.group(1), allow_proxy=True)
+            if path:
+                return path
+    return _guess_from_absolute_paths(text, allow_proxy=True)
 
 
 def _parse_cwd_from_text(text: str) -> Path | None:
@@ -180,16 +211,13 @@ def _parse_cwd_from_text(text: str) -> Path | None:
             raw = match.group(1).strip(" `'\".,;:")
             if not raw:
                 continue
-            try:
-                resolved = Path(raw).expanduser().resolve()
-            except OSError:
-                continue
-            if _is_proxy_install_dir(resolved):
-                return resolved
-            path = _normalize_path(raw)
+            path = _normalize_path(raw, allow_proxy=True)
             if path:
                 return path
-    return _guess_from_absolute_paths(text)
+    guessed = _guess_from_user_info(text)
+    if guessed:
+        return guessed
+    return _guess_from_absolute_paths(text, allow_proxy=True)
 
 
 def resolve_project_root(
@@ -198,13 +226,19 @@ def resolve_project_root(
 ) -> Path | None:
     """从 Claude Code 请求的 system / messages 解析工作目录（不由 run.sh 服务端指定）。"""
     blob = _collect_prompt_texts(system, messages)
-    if not blob:
-        return None
-    parsed = _parse_cwd_from_text(blob)
-    if parsed:
-        return parsed
-    if any(p.search(blob) for p in _CWD_PATTERNS):
-        return None
+    if blob:
+        parsed = _parse_cwd_from_text(blob)
+        if parsed:
+            _save_cached_root(parsed)
+            return parsed
+        if any(p.search(blob) for p in _CWD_PATTERNS):
+            return None
+
+    cached = _load_cached_root()
+    if cached:
+        print(f"[context] 使用缓存工作目录: {cached}")
+        return cached
+
     return None
 
 
