@@ -40,10 +40,6 @@ async def startup_all(*, refresh_credentials: bool = True) -> None:
                     from providers.deepseek import browser as b
 
                     need_refresh = not b.session_ready()
-                elif provider.id == "chatgpt":
-                    from providers.chatgpt import browser as b
-
-                    need_refresh = not b.session_ready()
             await provider.startup(refresh_credentials=need_refresh)
         except Exception as e:
             print(f"[startup] {provider.id} 跳过: {e}")
@@ -73,13 +69,11 @@ async def providers_health() -> dict:
 
 
 def _load_providers() -> None:
-    from providers.chatgpt.provider import ChatGPTProvider
     from providers.deepseek.provider import DeepSeekProvider
     from providers.doubao.provider import DoubaoProvider
 
     register_provider(DoubaoProvider())
     register_provider(DeepSeekProvider())
-    register_provider(ChatGPTProvider())
 
 
 _load_providers()

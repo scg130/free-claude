@@ -243,7 +243,6 @@ cleanup_browser_profile() {
 cleanup_stale_browsers() {
   cleanup_browser_profile "deepseek" "$DEEPSEEK_DEBUG_PORT"
   cleanup_browser_profile "doubao"
-  cleanup_browser_profile "chatgpt"
 }
 
 stop_old_api() {

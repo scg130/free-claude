@@ -165,35 +165,11 @@ class DeepSeekConfig:
         )
 
 
-@dataclass(frozen=True)
-class ChatGPTConfig:
-    chat_url: str
-    default_model: str
-    login_wait_sec: int
-    headless: bool
-    max_prompt_chars: int
-    max_project_context_chars: int
-
-    @classmethod
-    def from_env(cls) -> "ChatGPTConfig":
-        return cls(
-            chat_url=env_str("CHATGPT_CHAT_URL", "https://chatgpt.com/"),
-            default_model=env_str("CHATGPT_MODEL", "gpt-4o"),
-            login_wait_sec=max(60, env_int("CHATGPT_LOGIN_WAIT_SEC", 300)),
-            headless=env_bool("CHATGPT_HEADLESS", False),
-            max_prompt_chars=max(2_000, env_int("CHATGPT_MAX_PROMPT_CHARS", 8_000)),
-            max_project_context_chars=max(
-                1_000, env_int("CHATGPT_MAX_PROJECT_CONTEXT_CHARS", 4_000)
-            ),
-        )
-
-
 SERVER = ServerConfig.from_env()
 CONTEXT = ContextConfig.from_env()
 APP = AppConfig.from_env()
 DOUBAO = DoubaoConfig.from_env()
 DEEPSEEK = DeepSeekConfig.from_env()
-CHATGPT = ChatGPTConfig.from_env()
 
 # 浏览器通用（一般无需修改）
 BROWSER_VIEWPORT = {"width": 1280, "height": 800}

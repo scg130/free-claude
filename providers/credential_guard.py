@@ -45,31 +45,9 @@ async def _refresh_deepseek() -> None:
     await deepseek_browser.ensure_runtime_page()
 
 
-async def _validate_chatgpt() -> bool:
-    from providers.chatgpt import browser as chatgpt_browser
-
-    if not chatgpt_browser.PROFILE_DIR.exists() or not any(
-        chatgpt_browser.PROFILE_DIR.iterdir()
-    ):
-        return False
-    try:
-        return await chatgpt_browser.validate_session()
-    except Exception as exc:
-        print(f"[credential] chatgpt 校验失败: {exc}")
-        return False
-
-
-async def _refresh_chatgpt() -> None:
-    from providers.chatgpt import browser as chatgpt_browser
-
-    print("[credential] chatgpt 自动刷新凭证…")
-    await chatgpt_browser.refresh_credentials(headless=None)
-
-
 _CHECKERS = {
     "doubao": (_validate_doubao, _refresh_doubao),
     "deepseek": (_validate_deepseek, _refresh_deepseek),
-    "chatgpt": (_validate_chatgpt, _refresh_chatgpt),
 }
 
 

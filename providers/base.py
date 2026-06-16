@@ -27,7 +27,7 @@ class ChatResult:
 
 
 class ChatProvider(ABC):
-    """各 AI 平台统一接口（豆包 / DeepSeek / ChatGPT …）。"""
+    """各 AI 平台统一接口（豆包 / DeepSeek …）。"""
 
     id: str
     display_name: str
