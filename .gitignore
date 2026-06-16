@@ -4,6 +4,7 @@ venv
 .env
 params/*/session.json
 params/*/ws_params.json
+params/*
 .profiles/
 .doubao_browser_profile
 __pycache__/

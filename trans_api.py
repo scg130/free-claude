@@ -76,7 +76,8 @@ async def _run_chat(
     system: Any = None,
     tools: list[dict] | None = None,
 ) -> tuple[Any, str]:
-    provider = get_provider(_resolve_model(model))
+    resolved = _resolve_model(model)
+    provider = get_provider(resolved)
     conv_id = get_conv_id()
     user_text = _extract_user_text(messages)
 
@@ -198,6 +199,7 @@ async def anthropic_messages(req: MessagesRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
+        print(f"[api] /v1/messages 502 model={req.model}: {e}")
         raise HTTPException(status_code=502, detail=str(e)) from e
 
     msg_id = f"msg_{int(time.time())}"

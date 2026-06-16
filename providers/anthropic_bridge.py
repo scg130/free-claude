@@ -47,7 +47,13 @@ def _block_text(content) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _tool_summary(tools: list[dict]) -> str:
+def _tool_summary(tools: list[dict], *, compact: bool = False) -> str:
+    if compact:
+        names = [t.get("name", "") for t in tools if t.get("name")]
+        head = ", ".join(names[:50])
+        if len(names) > 50:
+            head += f" …共{len(names)}个"
+        return head
     lines = []
     for t in tools:
         name = t.get("name", "")
@@ -312,12 +318,17 @@ def build_agent_prompt(
     tools: list[dict] | None,
     *,
     project_context: str = "",
+    compact_tools: bool = False,
+    max_project_context_chars: int | None = None,
 ) -> str:
     """把 Anthropic 多轮对话 + 工具定义压成豆包可读的单一 prompt。"""
     sections: list[str] = []
 
     if project_context:
-        sections.append(project_context.strip())
+        ctx = project_context.strip()
+        if max_project_context_chars:
+            ctx = _truncate_text(ctx, max_project_context_chars)
+        sections.append(ctx)
 
     if system:
         if isinstance(system, str):
@@ -330,7 +341,7 @@ def build_agent_prompt(
     if tools:
         sections.append(
             "## 可用工具\n"
-            + _tool_summary(tools)
+            + _tool_summary(tools, compact=compact_tools)
             + "\n\n## 工具调用格式\n"
             "当你需要读文件、写文件、执行命令时，在回复末尾单独一行输出 JSON（不要用 markdown 代码块包裹）：\n"
             '{"tool_uses":[{"id":"toolu_001","name":"Read","input":{"file_path":"trans_api.py"}}]}\n'
@@ -422,12 +433,21 @@ async def run_agent_parse_loop(
     project_context: str = "",
     user_hint: str = "",
     max_attempts: int | None = None,
+    compact_tools: bool = False,
+    max_project_context_chars: int | None = None,
 ) -> AgentResult:
     """调用 LLM 并解析 tool_use；解析失败时重试（默认 RETRY_MAX 次）。"""
     from config import APP
 
     attempts = max(1, max_attempts or APP.retry_max)
-    base_prompt = build_agent_prompt(messages, system, tools, project_context=project_context)
+    base_prompt = build_agent_prompt(
+        messages,
+        system,
+        tools,
+        project_context=project_context,
+        compact_tools=compact_tools,
+        max_project_context_chars=max_project_context_chars,
+    )
     last_raw = ""
     agent = AgentResult()
 
