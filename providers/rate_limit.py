@@ -25,17 +25,40 @@ class RateLimiter:
             self._last_at = time.monotonic()
 
 
-def _resolve_min_interval(rpm: float = 0) -> float:
-    if APP.request_interval_sec > 0:
+def _resolve_min_interval(
+    rpm: float = 0,
+    *,
+    qps: float = 0,
+    qpm: float = 0,
+    use_global: bool = True,
+) -> float:
+    if use_global and APP.request_interval_sec > 0:
         return APP.request_interval_sec
-    effective_rpm = rpm if rpm > 0 else APP.rate_limit_rpm
+
+    intervals: list[float] = []
+    if qps > 0:
+        intervals.append(1.0 / qps)
+    if qpm > 0:
+        intervals.append(60.0 / qpm)
+
+    effective_rpm = rpm
+    if effective_rpm <= 0 and use_global:
+        effective_rpm = APP.rate_limit_rpm
     if effective_rpm > 0:
-        return 60.0 / effective_rpm
-    return 0.0
+        intervals.append(60.0 / effective_rpm)
+
+    return max(intervals) if intervals else 0.0
 
 
-def get_limiter(provider_id: str, rpm: float = 0) -> RateLimiter:
-    min_interval = _resolve_min_interval(rpm)
+def get_limiter(
+    provider_id: str,
+    rpm: float = 0,
+    *,
+    qps: float = 0,
+    qpm: float = 0,
+    use_global: bool = True,
+) -> RateLimiter:
+    min_interval = _resolve_min_interval(rpm, qps=qps, qpm=qpm, use_global=use_global)
     limiter = _limiters.get(provider_id)
     if limiter is None or limiter._min_interval != min_interval:
         _limiters[provider_id] = RateLimiter(min_interval)

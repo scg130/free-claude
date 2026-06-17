@@ -120,6 +120,8 @@ class DoubaoConfig:
     completion_url: str
     default_bot_id: str
     login_wait_sec: int
+    rate_limit_qps: float
+    rate_limit_qpm: float
 
     @classmethod
     def from_env(cls) -> "DoubaoConfig":
@@ -130,6 +132,8 @@ class DoubaoConfig:
             ),
             default_bot_id=env_str("DOUBAO_BOT_ID", "7338286299411103781"),
             login_wait_sec=max(60, env_int("DOUBAO_LOGIN_WAIT_SEC", 180)),
+            rate_limit_qps=max(0.0, env_float("DOUBAO_RATE_LIMIT_QPS", 10.0)),
+            rate_limit_qpm=max(0.0, env_float("DOUBAO_RATE_LIMIT_QPM", 60.0)),
         )
 
 

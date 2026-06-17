@@ -320,7 +320,12 @@ async def _chat_locked(prompt: str, conv_id: str, *, retried: bool = False) -> s
 
 
 async def chat_completion(prompt: str, conv_id: str) -> str:
-    await get_limiter(PROVIDER_ID, APP.rate_limit_rpm).acquire()
+    await get_limiter(
+        PROVIDER_ID,
+        qps=DOUBAO.rate_limit_qps,
+        qpm=DOUBAO.rate_limit_qpm,
+        use_global=False,
+    ).acquire()
 
     async def _call() -> str:
         async with _browser_lock:
